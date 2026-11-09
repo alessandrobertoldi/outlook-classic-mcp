@@ -83,7 +83,9 @@ It works with any account configured in Outlook: Exchange and Microsoft 365, IMA
    .\.venv\Scripts\python.exe .\test_accents.py
    ```
 
-   It must end with `RESULT: ALL OK`. (It needs `"phase": 3` or `4`; with `"deletion_enabled": false` the deletion checks are skipped.)
+   It must end with `RESULT: ALL OK`. (It needs `"phase": 3` or `4` and `attach_folders` set; with `"deletion_enabled": false` the deletion checks are skipped.)
+
+   The unit tests need no Outlook and run anywhere: `.\.venv\Scripts\python.exe -m unittest -v test_unit`.
 
 To update: replace the files, run `install.ps1` again if the dependencies changed, and restart Claude desktop completely. The server code is loaded when the app starts.
 
@@ -130,6 +132,10 @@ Collected during development, useful to whoever wants to change the code.
 - **Courtesy pauses.** Every call runs on Outlook's main thread: during a read of hundreds of items the UI stays frozen for the user. A pause of a few milliseconds every few items reduces the annoyance a lot; it does not remove it, because two Outlook instances on the same profile do not exist.
 - **Talking errors.** Every exception is converted into a `ToolError` with Outlook's own message (`excepinfo[2]`): Claude receives "Mailbox 'x' not found" instead of "Error executing tool", and can explain it to the user.
 
+## Versioning
+
+Releases are tagged (`v1.0.0`...) and described in `CHANGELOG.md`; `outlook_status` reports `server_version`. Only the latest release receives fixes.
+
 ## Known limits
 
 - The PC must be on, the user logged into Windows and classic Outlook open, not elevated.
@@ -149,7 +155,10 @@ Collected during development, useful to whoever wants to change the code.
 | `server.py` | the MCP server: every tool and every constraint, commented throughout |
 | `config.example.json` | configuration template with an explanation of every key |
 | `install.ps1` | creates `.venv`, installs the dependencies, tests COM, registers the server in Claude desktop |
-| `test_accents.py` | automatic test of the writing tools with accented letters, plus the security guards |
+| `test_accents.py` | end-to-end test on a real Outlook: writing tools with accented letters, plus the security guards |
+| `test_unit.py` | unit tests that run anywhere (no Outlook): path allow-list, file names, HTML filter, COM worker, rate limit, tool inventory |
+| `.github/workflows/tests.yml` | runs the unit tests on Linux and Windows at every push |
+| `CHANGELOG.md` | what changed in each version |
 | `requirements.txt` | the exact library versions the server is tested with |
 | `SECURITY.md` | how to report a vulnerability privately |
 | `README.it.md` | this document in Italian |

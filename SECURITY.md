@@ -30,4 +30,4 @@ administrator access to the PC or control of `config.json` (whoever can edit it 
 
 ## Supported versions
 
-Only the latest commit on `main` receives fixes.
+Only the latest tagged release (see `CHANGELOG.md`) receives fixes.

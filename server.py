@@ -49,6 +49,7 @@ import html as htmlmod
 import json
 import logging
 import logging.handlers
+import ntpath
 import os
 import queue
 import re
@@ -69,10 +70,13 @@ from mcp.types import ToolAnnotations
 # Configuration
 # ----------------------------------------------------------------------------
 
-# The configuration lives in config.json, next to this file. Without it the server stops with a clear message:
+__version__ = "1.0.0"
+
+# The configuration lives in config.json, next to this file (or in the file named by the environment variable
+# OUTLOOK_CLASSIC_MCP_CONFIG, used by the unit tests). Without it the server stops with a clear message:
 # copy config.example.json to config.json and fill it in (see README).
 BASE = Path(__file__).resolve().parent
-_cfg_path = BASE / "config.json"
+_cfg_path = Path(os.environ.get("OUTLOOK_CLASSIC_MCP_CONFIG") or (BASE / "config.json"))
 if not _cfg_path.exists():
     sys.stderr.write(f"outlook-classic-mcp: {_cfg_path} is missing. Copy config.example.json to config.json and fill it in.\n")
     sys.exit(1)
@@ -578,8 +582,9 @@ _DEVICE_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
 
 
 def _norm(path: str) -> str:
-    """Lexical normalisation, no disk access: '..' collapsed, '/' -> '\\', case folded (Windows is case-insensitive)."""
-    return os.path.normcase(os.path.normpath(path))
+    """Lexical normalisation with Windows rules, no disk access: '..' collapsed, '/' -> '\\', case folded (Windows is
+    case-insensitive). ntpath is used explicitly, so the same rules apply when the unit tests run on Linux."""
+    return ntpath.normcase(ntpath.normpath(path))
 
 
 def lexically_inside(path: str, roots: list[Path]) -> bool:
@@ -1090,7 +1095,7 @@ async def outlook_status() -> dict:
         # Only the configured mailboxes are reported: the names of the other stores in the profile are not exposed
         # (install.ps1 prints them for whoever fills in config.json).
         return {
-            "ok": True, "outlook_version": app.Version, "profile": n.CurrentProfileName,
+            "ok": True, "server_version": __version__, "outlook_version": app.Version, "profile": n.CurrentProfileName,
             "phase": PHASE, "default_mailbox": DEFAULT_MAILBOX,
             "mailboxes": {a: {"store": name, "present": name in stores} for a, name in MAILBOXES.items()},
         }
@@ -2181,5 +2186,5 @@ async def delete_event(id: str, expected_subject: str, whole_series: bool = Fals
 if __name__ == "__main__":
     # Started by Claude desktop over stdio: the server reads MCP requests from standard input and answers on standard
     # output. That is why logs go to a file and to stderr, never to stdout.
-    log.info("Starting outlook-classic-mcp, phase %s, timeout %s s, deletion %s", PHASE, TIMEOUT, DELETION)
+    log.info("Starting outlook-classic-mcp %s, phase %s, timeout %s s, deletion %s", __version__, PHASE, TIMEOUT, DELETION)
     mcp.run(transport="stdio")

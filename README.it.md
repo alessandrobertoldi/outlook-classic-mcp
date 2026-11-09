@@ -85,7 +85,9 @@ Funziona con qualunque account configurato in Outlook: Exchange e Microsoft 365,
    .\.venv\Scripts\python.exe .\test_accents.py
    ```
 
-   Deve finire con `RESULT: ALL OK`. (Richiede `"phase": 3` o `4`; con `"deletion_enabled": false` i controlli di cancellazione vengono saltati.)
+   Deve finire con `RESULT: ALL OK`. (Richiede `"phase": 3` o `4` e `attach_folders` impostato; con `"deletion_enabled": false` i controlli di cancellazione vengono saltati.)
+
+   I test unitari non hanno bisogno di Outlook e girano ovunque: `.\.venv\Scripts\python.exe -m unittest -v test_unit`.
 
 Per aggiornare: sostituisci i file, rilancia `install.ps1` se sono cambiate le dipendenze, e riavvia completamente Claude desktop. Il codice del server viene caricato all'avvio dell'app.
 
@@ -131,6 +133,10 @@ Raccolte durante lo sviluppo, utili a chi vuole modificare il codice.
 - **Pause di cortesia.** Ogni chiamata gira sul filo principale di Outlook: durante una lettura di centinaia di elementi l'interfaccia resta ferma per l'utente. Una pausa di pochi millisecondi ogni pochi elementi riduce molto il fastidio; non lo elimina, perché due istanze di Outlook sullo stesso profilo non esistono.
 - **Errori parlanti.** Ogni eccezione viene convertita in `ToolError` con il messaggio di Outlook (`excepinfo[2]`): Claude riceve "Mailbox 'x' not found" invece di "Error executing tool", e sa spiegarlo all'utente.
 
+## Versioni
+
+Le versioni sono etichettate (`v1.0.0`...) e descritte in `CHANGELOG.md`; `outlook_status` riporta `server_version`. Solo l'ultima versione riceve correzioni.
+
 ## Limiti noti
 
 - Serve il PC acceso, l'utente collegato a Windows e Outlook Classic aperto, non elevato.
@@ -150,7 +156,10 @@ Raccolte durante lo sviluppo, utili a chi vuole modificare il codice.
 | `server.py` | il server MCP: tutte le funzioni e tutti i vincoli, commentato per intero |
 | `config.example.json` | modello di configurazione con la spiegazione di ogni chiave |
 | `install.ps1` | crea `.venv`, installa le dipendenze, prova il COM, registra il server in Claude desktop |
-| `test_accents.py` | prova automatica delle funzioni di scrittura con lettere accentate, più i controlli di sicurezza |
+| `test_accents.py` | prova completa su un Outlook vero: funzioni di scrittura con lettere accentate, più i controlli di sicurezza |
+| `test_unit.py` | test unitari che girano ovunque (senza Outlook): percorsi consentiti, nomi dei file, filtro HTML, thread COM, limite degli avvisi, inventario degli strumenti |
+| `.github/workflows/tests.yml` | esegue i test unitari su Linux e Windows a ogni push |
+| `CHANGELOG.md` | cosa è cambiato in ogni versione |
 | `requirements.txt` | le versioni esatte delle librerie con cui il connettore è provato |
 | `SECURITY.md` | come segnalare una vulnerabilità in privato |
 | `README.md` | questo documento in inglese |
