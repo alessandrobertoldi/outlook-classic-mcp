@@ -1,133 +1,134 @@
 # outlook-classic-mcp
 
-Connettore MCP locale che collega Claude (Claude desktop e Cowork) a **Outlook Classic per Windows**: posta, calendario, rubrica, attività, note e cartelle, attraverso il modello a oggetti COM di Outlook. Usa la sessione di Outlook già aperta sul PC: nessuna password, nessun server esterno, nessuna porta di rete.
+A local MCP server that connects Claude (Claude desktop and Cowork) to **classic Outlook for Windows**: mail, calendar, contacts, tasks, notes and folders, through Outlook's COM object model. It uses the Outlook session already open on the PC: no passwords, no external server, no network port.
 
-> **English summary.** A local MCP server (Python, pywin32) that lets Claude desktop and Cowork work with classic Outlook for Windows through COM automation: read and search mail (unread mail stays unread), save attachments and .msg files with SHA-256 fingerprints, create drafts and reply drafts, read/create/modify calendar events including recurring series and single occurrences, manage contacts, tasks, notes and folders. Safety rules are enforced in code, not in prompts: no sending (except one alert tool with a fixed, configured recipient), no permanent deletion (trash only, with subject confirmation), no credentials. Everything personal lives in `config.json`. The code, tool names and documentation are in Italian; Claude handles that transparently.
+*Versione italiana: [README.it.md](README.it.md).*
 
-## Che cosa fa
+## What it does
 
-Una volta installato, in Claude desktop o Cowork puoi scrivere cose come "ci sono mail non lette del cliente Rossi?", "metti in calendario una telefonata martedì alle 10", "prepara una bozza di risposta a quest'ultima mail", "salva gli allegati di quella fattura", "cosa ho in agenda questa settimana", e Claude lo fa nel tuo Outlook, con i tuoi account, senza uscire dal PC.
+Once installed, in Claude desktop or Cowork you can say things like "any unread mail from the Smith account?", "put a phone call in my calendar on Tuesday at 10", "draft a reply to this last mail", "save the attachments of that invoice", "what is on my agenda this week", and Claude does it in your Outlook, with your accounts, without leaving the PC.
 
-Strumenti esposti (32):
+Tools exposed (32):
 
-| Area | Strumenti |
+| Area | Tools |
 |---|---|
-| Stato e cartelle | `stato_outlook`, `elenca_cartelle`, `crea_cartella` |
-| Posta | `elenca_mail`, `cerca_mail`, `leggi_mail` (anche intestazioni di trasporto per SPF, DKIM, DMARC), `salva_allegati`, `salva_mail` (.msg con impronta SHA-256), `segna_mail`, `sposta_mail` |
-| Bozze | `crea_bozza`, `crea_bozza_risposta` |
-| Calendario | `elenca_eventi`, `leggi_evento`, `crea_evento` (anche serie ricorrenti), `modifica_evento` (intera serie o singola occorrenza) |
-| Rubrica | `cerca_contatti`, `elenca_contatti`, `leggi_contatto`, `crea_contatto`, `modifica_contatto` |
-| Attività | `elenca_attivita`, `leggi_attivita`, `crea_attivita`, `modifica_attivita` |
-| Note | `elenca_note`, `leggi_nota`, `crea_nota`, `modifica_nota` |
-| Avvisi | `invia_avviso` (unica funzione di invio, destinatario fisso) |
-| Cancellazione | `elimina_mail`, `elimina_evento` (solo nel cestino, con conferma dell'oggetto) |
+| Status and folders | `outlook_status`, `list_folders`, `create_folder` |
+| Mail | `list_mail`, `search_mail`, `read_mail` (optionally with transport headers for SPF, DKIM, DMARC), `save_attachments`, `save_mail` (.msg with SHA-256 fingerprint), `mark_mail`, `move_mail` |
+| Drafts | `create_draft`, `create_reply_draft` |
+| Calendar | `list_events`, `read_event`, `create_event` (recurring series too), `update_event` (whole series or a single occurrence) |
+| Contacts | `search_contacts`, `list_contacts`, `read_contact`, `create_contact`, `update_contact` |
+| Tasks | `list_tasks`, `read_task`, `create_task`, `update_task` |
+| Notes | `list_notes`, `read_note`, `create_note`, `update_note` |
+| Alerts | `send_alert` (the only sending tool, fixed recipient) |
+| Deletion | `delete_mail`, `delete_event` (trash only, with subject confirmation) |
 
-## Regole di sicurezza, scritte nel codice
+## Safety rules, enforced in code
 
-Il connettore è pensato per essere usato da un'intelligenza artificiale, quindi i limiti non sono raccomandazioni in un prompt ma controlli nel codice, che Claude non può aggirare:
+The server is meant to be driven by an AI, so its limits are not recommendations in a prompt but checks in the code, which Claude cannot talk its way around:
 
-- **Non invia posta.** Le mail nascono come bozze nella cartella Bozze: le rileggi, le firmi se vuoi, le spedisci tu. L'unica eccezione è `invia_avviso`, che scrive solo dal mittente al destinatario fissati in `config.json` (tipicamente da un tuo indirizzo a un altro tuo indirizzo): Claude sceglie oggetto e testo, mai a chi scrivere.
-- **Non cancella in modo definitivo.** `elimina_mail` ed `elimina_evento` spostano nel cestino della casella, solo se l'oggetto passato coincide con quello reale, mai dal cestino stesso, mai riunioni con invitati. Si spengono con `"cancellazione_abilitata": false`. Contatti, attività, note e cartelle non si cancellano affatto. Unica eccezione tecnica: la cancellazione di una singola occorrenza di una serie, che Outlook non fa passare dal cestino (lo strumento lo dichiara nella sua descrizione, così Claude lo dice all'utente prima di chiedere conferma).
-- **Le mail non lette restano non lette**, anche dopo che Claude le ha lette, ne ha salvato gli allegati, ha preparato una risposta o le ha spostate.
-- **Scrive file solo nelle cartelle che hai elencato** in `cartelle_salvataggio`, senza mai sovrascrivere, e accanto a ogni file lascia un'impronta SHA-256 con data e ora (catena di custodia).
-- **Nessuna credenziale.** Si aggancia all'Outlook già aperto; se Outlook è chiuso risponde con un errore, non lo avvia e non chiede password.
-- **Non tocca regole, impostazioni, account.**
-- **Tutte le scritture finiscono in un registro** (`%LOCALAPPDATA%\outlook-classic-mcp\audit.log`: strumento, casella, id, oggetto; mai il contenuto).
-- **Fasi progressive.** Con `"fase": 1` il connettore legge soltanto; 2 aggiunge bozze e scritture non distruttive; 3 il calendario; 4 gli avvisi. Si parte da 1 e si sale quando ci si fida.
+- **It does not send mail.** Mail is born as a draft in the Drafts folder: you review it, sign it if you wish, and send it yourself. The one exception is `send_alert`, which writes only from the sender to the recipient fixed in `config.json` (typically from one address of yours to another): Claude chooses subject and body, never who receives it.
+- **It never deletes permanently.** `delete_mail` and `delete_event` move items to the mailbox trash, only if the subject passed matches the real one, never from the trash itself, never meetings with attendees. They are off unless `"deletion_enabled": true`. Contacts, tasks, notes and folders cannot be deleted at all. One technical exception: deleting a single occurrence of a recurring series, which Outlook does not route through the trash (the tool says so in its description, so Claude tells the user before asking for confirmation).
+- **Unread mail stays unread**, even after Claude has read it, saved its attachments, drafted a reply or moved it.
+- **It writes files only into the folders you listed** in `save_folders`, never overwriting, and leaves a SHA-256 fingerprint with date and time next to every file (chain of custody).
+- **No credentials.** It attaches to the Outlook already running; when Outlook is closed it answers with an error, it does not start it and does not ask for a password.
+- **It does not touch rules, settings or accounts.**
+- **Every write is logged** (`%LOCALAPPDATA%\outlook-classic-mcp\audit.log`: tool, mailbox, id, subject; never the content).
+- **Progressive phases.** With `"phase": 1` the server only reads; 2 adds drafts and non-destructive writes; 3 the calendar; 4 the alerts. Start at 1 and move up as trust grows.
 
-## Requisiti
+## Requirements
 
-- Windows 10 o 11 con **Outlook Classic** (l'Outlook di Microsoft 365 o Office 2016 e successivi, processo `OUTLOOK.EXE`). Il "nuovo Outlook" (`olk.exe`) non espone COM e non funziona.
-- Outlook aperto come utente normale (non "come amministratore": i processi con privilegi diversi non si vedono fra loro).
-- **Python 3.11 o più recente** da [python.org](https://www.python.org/downloads/windows/), oppure [uv](https://docs.astral.sh/uv/).
-- **Claude desktop** per Windows, con Cowork se vuoi usarlo da lì.
+- Windows 10 or 11 with **classic Outlook** (the Outlook of Microsoft 365 or Office 2016 and later, process `OUTLOOK.EXE`). The "new Outlook" (`olk.exe`) exposes no COM interface and does not work.
+- Outlook running as a normal user (not "as administrator": processes with different privileges cannot see each other).
+- **Python 3.11 or newer** from [python.org](https://www.python.org/downloads/windows/), or [uv](https://docs.astral.sh/uv/).
+- **Claude desktop** for Windows, with Cowork if you want to use it from there.
 
-Funziona con qualunque account configurato in Outlook: Exchange e Microsoft 365, IMAP, POP, file di dati .pst, e anche server come Kerio Connect tramite il suo connettore KOFF (è l'ambiente in cui è nato e in cui è verificato ogni giorno).
+It works with any account configured in Outlook: Exchange and Microsoft 365, IMAP, POP, .pst data files, and also servers such as Kerio Connect through its KOFF connector (the environment it was born in and is verified in every day). Outlook's language does not matter: default folders are reached by their internal type, with name lookups in English, Italian, German, French and Spanish as a fallback.
 
-## Installazione
+## Installation
 
-1. Scarica il repository (Code > Download ZIP, oppure `git clone`) in una cartella stabile, per esempio `C:\Users\<tuo utente>\Claude\outlook-classic-mcp`. Non spostarla dopo l'installazione: il percorso finisce nella configurazione di Claude desktop.
+1. Download the repository (Code > Download ZIP, or `git clone`) into a stable folder, for example `C:\Users\<your user>\Claude\outlook-classic-mcp`. Do not move it after installing: its path goes into Claude desktop's configuration.
 
-2. Copia `config.example.json` in `config.json` e compila i valori fra `< >` (sotto trovi la spiegazione di ogni chiave). Serve soprattutto il nome esatto dei tuoi archivi di Outlook: lo leggi nel riquadro delle cartelle di Outlook (il nome in grassetto in cima a ogni account), oppure lo stampa lo script di installazione al passo successivo.
+2. Copy `config.example.json` to `config.json` and fill in the values in `< >` (every key is explained below). Above all you need the exact names of your Outlook stores: read them in Outlook's folder pane (the bold name at the top of each account), or let the installer print them in the next step.
 
-3. Apri Outlook. Poi, in **Windows PowerShell** (utente normale), dalla cartella del connettore:
-
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\installa.ps1"
-   ```
-
-   Lo script crea un ambiente Python isolato (`.venv`), installa `mcp` e `pywin32`, prova il collegamento con Outlook, prova ad avviare il server e registra la voce `outlook` nel file `claude_desktop_config.json` di Claude desktop, conservando gli altri server MCP che hai già.
-
-4. Chiudi **completamente** Claude desktop (icona nell'area di notifica > Esci) e riaprilo. Il connettore compare fra i connettori locali. Prova con: "controlla lo stato di Outlook".
-
-5. Consigliato: lancia la prova automatica, che esercita tutte le funzioni di scrittura con lettere accentate e ripulisce dopo di sé:
+3. Open Outlook. Then, in **Windows PowerShell** (normal user), from the server folder:
 
    ```powershell
-   .\.venv\Scripts\python.exe .\prova_accenti.py
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1"
    ```
 
-   Deve finire con `ESITO: TUTTO OK`. (Richiede `"fase": 3` o `4`; con `"cancellazione_abilitata": false` i controlli di cancellazione vengono saltati.)
+   The script creates an isolated Python environment (`.venv`), installs `mcp` and `pywin32`, tests the connection to Outlook, test-starts the server and registers the `outlook` entry in Claude desktop's `claude_desktop_config.json`, keeping any other MCP server you already have.
 
-Per aggiornare: sostituisci i file, rilancia `installa.ps1` se sono cambiate le dipendenze, e riavvia completamente Claude desktop. Il codice del server viene caricato all'avvio dell'app.
+4. Quit Claude desktop **completely** (tray icon > Quit) and open it again. The server appears among the local connectors. Try: "check the Outlook status".
 
-## Configurazione (`config.json`)
+5. Recommended: run the automatic test, which exercises every writing tool with accented letters and cleans up after itself:
 
-| Chiave | Obbligatoria | Significato |
+   ```powershell
+   .\.venv\Scripts\python.exe .\test_accents.py
+   ```
+
+   It must end with `RESULT: ALL OK`. (It needs `"phase": 3` or `4`; with `"deletion_enabled": false` the deletion checks are skipped.)
+
+To update: replace the files, run `install.ps1` again if the dependencies changed, and restart Claude desktop completely. The server code is loaded when the app starts.
+
+## Configuration (`config.json`)
+
+| Key | Required | Meaning |
 |---|---|---|
-| `fase` | no (1) | 1 sola lettura, 2 anche bozze, contatti, attività, note, cartelle, spostamenti e cancellazione mail, 3 anche calendario, 4 anche `invia_avviso` |
-| `timeout_secondi` | no (40) | attesa massima per una chiamata a Outlook; oltre, errore spiegato ("probabile finestra aperta in Outlook") |
-| `max_caratteri_corpo` | no (20000) | lunghezza massima dei testi restituiti in una lettura |
-| `caselle` | **sì** | alias breve → nome esatto dell'archivio in Outlook; gli archivi non elencati restano invisibili |
-| `casella_predefinita` | **sì** | alias usato quando Claude non ne indica uno |
-| `cartelle_salvataggio` | **sì** | cartelle (e sottocartelle) in cui il connettore può scrivere file |
-| `cancellazione_abilitata` | no (false) | attiva `elimina_mail` ed `elimina_evento` |
-| `avviso.mittente`, `avviso.destinatario`, `avviso.prefisso_oggetto` | no | mittente (un account di Outlook) e unico destinatario di `invia_avviso`; senza la sezione, l'invio è sempre rifiutato |
-| `pausa_cortesia_ms`, `pausa_ogni_elementi` | no (10, 3) | pause durante le letture lunghe per lasciare respirare la finestra di Outlook; rilette al volo senza riavvio |
+| `phase` | no (1) | 1 read only, 2 also drafts, contacts, tasks, notes, folders, moves and mail deletion, 3 also calendar, 4 also `send_alert` |
+| `timeout_seconds` | no (40) | maximum wait for one call into Outlook; beyond it, an explained error ("a modal window is probably open in Outlook") |
+| `max_body_chars` | no (20000) | maximum length of texts returned in one read |
+| `mailboxes` | **yes** | short alias → exact store name in Outlook; stores not listed stay invisible |
+| `default_mailbox` | **yes** | alias used when Claude names none |
+| `save_folders` | **yes** | folders (and subfolders) the server may write files to |
+| `deletion_enabled` | no (false) | enables `delete_mail` and `delete_event` |
+| `alert.sender`, `alert.recipient`, `alert.subject_prefix` | no | sender (an Outlook account) and only recipient of `send_alert`; without the section, sending is always refused |
+| `courtesy_pause_ms`, `pause_every_items` | no (10, 3) | pauses during long reads so that the Outlook window keeps breathing; re-read on the fly without a restart |
 
-`config.json` è personale ed è escluso dal repository tramite `.gitignore`: non pubblicarlo.
+`config.json` is personal and excluded from the repository through `.gitignore`: do not publish it.
 
-## Come lavora con Claude
+## How it works with Claude
 
-- Claude vede ogni strumento con la sua descrizione (la docstring in `server.py`) e gli alias delle caselle nelle istruzioni del server. Gli elenchi restituiscono solo metadati (id, oggetto, mittente, data); il contenuto si legge a parte, così le conversazioni restano leggere.
-- Gli id sono gli `EntryID` di Outlook: Claude li riceve dagli elenchi e li passa alle funzioni di lettura e modifica. Un elemento spostato cambia id.
-- Le date si scrivono `AAAA-MM-GG` o `AAAA-MM-GG HH:MM`, ora locale.
-- Per le serie ricorrenti, `elenca_eventi` restituisce una riga per occorrenza con l'id della serie; `modifica_evento` ed `elimina_evento` agiscono sull'intera serie, oppure su una sola occorrenza se ricevono `data_occorrenza` (l'inizio esatto riportato dall'elenco).
-- Le etichette colorate degli appuntamenti (`telefonata`, `lavoro`, `importante`...) sono la vecchia proprietà "Label" di Outlook: alcuni server (per esempio Kerio Connect) le mostrano come colori, altri le ignorano senza danno.
+- Claude sees every tool with its description (the docstring in `server.py`) and the mailbox aliases in the server instructions. Listings return metadata only (id, subject, sender, date); content is read separately, so conversations stay light.
+- Ids are Outlook `EntryID`s: Claude receives them from listings and passes them to the read and update tools. A moved item changes id.
+- Dates are written `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`, local time.
+- For recurring series, `list_events` returns one row per occurrence carrying the series id; `update_event` and `delete_event` act on the whole series, or on one occurrence when they receive `occurrence_date` (the exact start reported by the listing).
+- The coloured labels of appointments (`phone_call`, `business`, `important`...) are Outlook's old "Label" property: some servers (Kerio Connect, for instance) show them as colours, others ignore them harmlessly.
 
-Suggerimento per chi usa Cowork con attività programmate: tieni Outlook aperto, perché il connettore non lo avvia; se un'attività deve avvisarti di qualcosa, `invia_avviso` è fatta per quello.
+A tip for Cowork users with scheduled tasks: keep Outlook open, because the server does not start it; when a task must warn you about something, `send_alert` is made for that.
 
-## Lezioni tecniche (Outlook COM da Python)
+## Technical lessons (Outlook COM from Python)
 
-Raccolte durante lo sviluppo, utili a chi vuole modificare il codice.
+Collected during development, useful to whoever wants to change the code.
 
-- **Un solo thread COM.** Gli oggetti di Outlook vanno usati dal thread che li ha creati (STA). Il server è asincrono, quindi tutte le chiamate passano da un thread dedicato con una coda e un timeout (`ComWorker`). Un blocco di Outlook (finestra modale) produce un errore spiegato, non un server appeso.
-- **Filtri per data in DASL con date ISO in UTC** (`@SQL="urn:schemas:httpmail:datereceived" >= '2026-11-09 15:00'`). Il formato Jet classico (`[ReceivedTime] >= 'MM/dd/yyyy'`) viene interpretato con le impostazioni regionali di Windows e su un sistema italiano scambia giorno e mese.
-- **Date in scrittura marcate come UTC.** pywin32 converte una `datetime` senza fuso da ora locale a UTC spostandola; passandola con `tzinfo=UTC` arriva a Outlook invariata e viene letta come ora locale (`com_data`).
-- **Ricorrenze:** `Items.Sort("[Start]")`, `IncludeRecurrences = True`, poi `Restrict` con il filtro DASL, e si itera con l'enumeratore (mai `Count` o indice). Una serie si costruisce con `GetRecurrencePattern()` dopo aver impostato `Start`, `End` e `Duration`, nell'ordine RecurrenceType, DayOfWeekMask o DayOfMonth/MonthOfYear, Interval, PatternStartDate, StartTime, EndTime, Duration, e per ultima la fine. La singola occorrenza si raggiunge con `GetOccurrence(data_inizio)`.
-- **Accenti nelle bozze:** impostare `InternetCodepage = 65001` prima di scrivere `HTMLBody`, e scrivere sempre HTML (anche per il "testo semplice"): con `Body` la bozza resta nella pagina di codice del profilo e gli accenti possono corrompersi. Nelle risposte, leggere l'HTML dell'originale **prima** di cambiare la pagina di codice, togliere i `<meta charset>` e inserire il testo nuovo subito dopo `<body>`.
-- **Cancellare un evento con `Delete()`, non con `Move()` nel cestino.** Posta eliminata è una cartella di posta: alcuni provider convertono l'appuntamento spostato in un messaggio con allegato .msg (e accenti rotti). `Delete()` è ciò che fa il tasto Canc e lascia un evento ripristinabile.
-- **Dopo `Send()` l'oggetto COM non è più leggibile:** i dati da restituire si prendono prima.
-- **Pause di cortesia.** Ogni chiamata gira sul filo principale di Outlook: durante una lettura di centinaia di elementi l'interfaccia resta ferma per l'utente. Una pausa di pochi millisecondi ogni pochi elementi riduce molto il fastidio; non lo elimina, perché due istanze di Outlook sullo stesso profilo non esistono.
-- **Errori parlanti.** Ogni eccezione viene convertita in `ToolError` con il messaggio di Outlook (`excepinfo[2]`): Claude riceve "Casella 'x' non trovata" invece di "Error executing tool", e sa spiegarlo all'utente.
+- **One COM thread.** Outlook objects must be used from the thread that created them (STA). The server is asynchronous, so every call goes through a dedicated thread with a queue and a timeout (`ComWorker`). A frozen Outlook (modal window) produces an explained error, not a hung server.
+- **Date filters in DASL with ISO dates in UTC** (`@SQL="urn:schemas:httpmail:datereceived" >= '2026-11-09 15:00'`). The classic Jet format (`[ReceivedTime] >= 'MM/dd/yyyy'`) is parsed with the Windows regional settings and on a non-US system swaps day and month.
+- **Written dates marked as UTC.** pywin32 converts a naive `datetime` from local time to UTC, shifting it; passed with `tzinfo=UTC` it reaches Outlook unchanged and is read as local time (`com_date`).
+- **Recurrences:** `Items.Sort("[Start]")`, `IncludeRecurrences = True`, then `Restrict` with the DASL filter, and iterate with the enumerator (never `Count` or index). A series is built with `GetRecurrencePattern()` after `Start`, `End` and `Duration` are set, in the order RecurrenceType, DayOfWeekMask or DayOfMonth/MonthOfYear, Interval, PatternStartDate, StartTime, EndTime, Duration, and the end last. A single occurrence is reached with `GetOccurrence(start_date)`.
+- **Accents in drafts:** set `InternetCodepage = 65001` before writing `HTMLBody`, and always write HTML (even for "plain text"): with `Body` the draft stays in the profile's code page and accents may get corrupted. In replies, read the original's HTML **before** changing the code page, remove the `<meta charset>` tags and insert the new text right after `<body>`.
+- **Delete an event with `Delete()`, not with `Move()` to the trash.** Deleted Items is a mail folder: some providers convert the moved appointment into a message with a .msg attachment (and broken accents). `Delete()` is what the Delete key does and leaves a restorable event.
+- **After `Send()` the COM object is no longer readable:** take the data to return before.
+- **Courtesy pauses.** Every call runs on Outlook's main thread: during a read of hundreds of items the UI stays frozen for the user. A pause of a few milliseconds every few items reduces the annoyance a lot; it does not remove it, because two Outlook instances on the same profile do not exist.
+- **Talking errors.** Every exception is converted into a `ToolError` with Outlook's own message (`excepinfo[2]`): Claude receives "Mailbox 'x' not found" instead of "Error executing tool", and can explain it to the user.
 
-## Limiti noti
+## Known limits
 
-- Serve il PC acceso, l'utente collegato a Windows e Outlook Classic aperto, non elevato.
-- Le mail cifrate (PGP, S/MIME) arrivano cifrate: le decifra solo Outlook nella sua finestra.
-- La ricerca nel corpo dei messaggi (`cerca_mail` con `in_corpo=true`) è lenta sulle cartelle con decine di migliaia di mail: per questo richiede un intervallo di date.
-- La cancellazione di una singola occorrenza di una serie non passa dal cestino (comportamento di Outlook).
-- Outlook e Claude desktop devono girare con gli stessi privilegi (entrambi utente normale).
+- The PC must be on, the user logged into Windows and classic Outlook open, not elevated.
+- Encrypted mail (PGP, S/MIME) arrives encrypted: only Outlook decrypts it, in its own window.
+- Body search (`search_mail` with `in_body=true`) is slow on folders with tens of thousands of messages: that is why it requires a date range.
+- Deleting a single occurrence of a series does not go through the trash (Outlook behaviour).
+- Outlook and Claude desktop must run with the same privileges (both as a normal user).
 
-## Struttura del repository
+## Repository layout
 
-| File | Cosa fa |
+| File | What it does |
 |---|---|
-| `server.py` | il server MCP: tutte le funzioni e tutti i vincoli, commentato riga per riga |
-| `config.example.json` | modello di configurazione con la spiegazione di ogni chiave |
-| `installa.ps1` | crea `.venv`, installa le dipendenze, prova il COM, registra il server in Claude desktop |
-| `prova_accenti.py` | prova automatica delle funzioni di scrittura con lettere accentate |
-| `.gitignore` | esclude `config.json`, `.venv`, registri e copie di sicurezza |
+| `server.py` | the MCP server: every tool and every constraint, commented throughout |
+| `config.example.json` | configuration template with an explanation of every key |
+| `install.ps1` | creates `.venv`, installs the dependencies, tests COM, registers the server in Claude desktop |
+| `test_accents.py` | automatic test of the writing tools with accented letters |
+| `README.it.md` | this document in Italian |
+| `.gitignore` | excludes `config.json`, `.venv`, logs and backup copies |
 
-## Licenza
+## License
 
-MIT: vedi `LICENSE`. Il software è fornito così com'è; prima di dare a un'intelligenza artificiale accesso alla propria posta, si consiglia di partire dalla fase 1 e di leggere il registro `audit.log` nei primi giorni.
+MIT: see `LICENSE`. The software is provided as is; before giving an AI access to your mailbox, start from phase 1 and read `audit.log` during the first days.

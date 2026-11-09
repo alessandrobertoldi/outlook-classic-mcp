@@ -1,33 +1,30 @@
 """
-outlook-classic-mcp: server MCP locale che collega Claude (Claude desktop, Cowork) a Outlook Classic per Windows.
+outlook-classic-mcp: a local MCP server that connects Claude (Claude desktop, Cowork) to classic Outlook for Windows.
 
-COME FUNZIONA, IN BREVE
-- Il server gira sul PC dell'utente, lanciato da Claude desktop (trasporto stdio: nessuna porta di rete aperta).
-- Parla con Outlook Classic attraverso il modello a oggetti COM (libreria pywin32), agganciandosi alla sessione di
-  Outlook GIA' APERTA dall'utente. Non avvia Outlook, non conosce password: usa gli account che Outlook ha già.
-- Ogni funzione esposta a Claude (uno "strumento" MCP) è una coroutine `async def` decorata con `@mcp.tool`.
-  Il lavoro vero avviene in una piccola funzione interna `f()` che viene eseguita nel thread COM (vedi ComWorker).
-- Tutto ciò che dipende dall'utente (nomi delle caselle, cartelle in cui si può salvare, mittente e destinatario
-  degli avvisi) sta in `config.json`, mai nel codice. Il file `config.example.json` spiega ogni chiave.
+HOW IT WORKS, IN SHORT
+- The server runs on the user's PC and is launched by Claude desktop over stdio: no network port is opened.
+- It talks to classic Outlook through the COM object model (pywin32 library), attaching to the Outlook session the
+  user has ALREADY opened. It never starts Outlook and never knows a password: it uses the accounts Outlook has.
+- Every function exposed to Claude (an MCP "tool") is an `async def` coroutine decorated with `@mcp.tool`. The real
+  work happens in a small inner function `f()` that is executed on the COM thread (see ComWorker below).
+- Everything that depends on the user (mailbox names, folders the server may write to, sender and recipient of the
+  alerts) lives in `config.json`, never in the code. `config.example.json` explains every key.
 
-REGOLE FISSATE NEL CODICE (non in un prompt, quindi non aggirabili da Claude)
-- Nessuna funzione invia posta, salvo `invia_avviso`, che ha mittente e destinatario fissi presi dalla
-  configurazione: Claude può scegliere solo oggetto e testo, mai a chi scrivere.
-- Nessuna funzione cancella in modo definitivo. `elimina_mail` ed `elimina_evento` spostano l'elemento nel cestino
-  della sua casella (recuperabile), solo se `oggetto_atteso` coincide con l'oggetto reale, mai dal cestino, mai
-  riunioni con invitati. Si disattivano con `"cancellazione_abilitata": false`. Unica eccezione: la cancellazione di
-  una singola occorrenza di una serie, che Outlook non fa passare dal cestino (è documentato nello strumento).
-- Nessuna funzione cancella contatti, attività, note o cartelle; nessuna tocca regole, impostazioni o account.
-- Ogni mail non letta che Claude legge (o salva, o a cui prepara una risposta, o che sposta) torna non letta.
-- `salva_mail` e `salva_allegati` scrivono solo nelle cartelle consentite dalla configurazione, mai sovrascrivendo,
-  e lasciano accanto a ogni file un'impronta SHA-256 (utile come catena di custodia).
-- Tutte le scritture finiscono in un registro (audit.log): strumento, casella, id; mai il contenuto.
+RULES ENFORCED IN CODE (not in a prompt, so Claude cannot talk its way around them)
+- No tool sends mail, except `send_alert`, whose sender and recipient are fixed in the configuration: Claude can only
+  choose subject and body, never who receives it.
+- No tool deletes permanently. `delete_mail` and `delete_event` move the item to the trash of its own mailbox
+  (recoverable), only if `expected_subject` matches the real subject, never from the trash itself, never meetings with
+  attendees. Both are disabled unless `"deletion_enabled": true`. The one exception is deleting a single occurrence of a
+  recurring series, which Outlook does not route through the trash (the tool description says so).
+- No tool deletes contacts, tasks, notes or folders; no tool touches rules, settings or accounts.
+- Every unread mail Claude reads (or saves, or drafts a reply to, or moves) is left unread.
+- `save_mail` and `save_attachments` write only inside the folders allowed by the configuration, never overwrite, and
+  leave a SHA-256 fingerprint file next to every saved file (useful as a chain of custody).
+- Every write operation is logged (audit.log): tool, mailbox, id; never the content.
 
-FASI (chiave "fase" di config.json): 1 = sola lettura, 2 = anche bozze, contatti, attività, note, cartelle,
-3 = anche calendario, 4 = anche invio avvisi vincolato. Si parte da 1 e si sale quando ci si fida.
-
-LINGUA: nomi degli strumenti, parametri e messaggi sono in italiano, perché il connettore è nato per un utente
-italiano e Claude li legge senza problemi. Il codice è commentato in italiano.
+PHASES (key "phase" in config.json): 1 = read-only, 2 = also drafts, contacts, tasks, notes, folders,
+3 = also calendar, 4 = also the constrained alert sending. Start at 1 and move up as trust grows.
 """
 
 from __future__ import annotations
@@ -55,101 +52,100 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 # ----------------------------------------------------------------------------
-# Configurazione
+# Configuration
 # ----------------------------------------------------------------------------
 
-# La configurazione sta in config.json, nella stessa cartella di questo file. Senza config.json il server si ferma
-# con un messaggio chiaro: il file config.example.json va copiato in config.json e compilato (vedi README).
+# The configuration lives in config.json, next to this file. Without it the server stops with a clear message:
+# copy config.example.json to config.json and fill it in (see README).
 BASE = Path(__file__).resolve().parent
 _cfg_path = BASE / "config.json"
 if not _cfg_path.exists():
-    sys.stderr.write(
-        f"outlook-classic-mcp: manca {_cfg_path}. Copiare config.example.json in config.json e compilarlo.\n"
-    )
+    sys.stderr.write(f"outlook-classic-mcp: {_cfg_path} is missing. Copy config.example.json to config.json and fill it in.\n")
     sys.exit(1)
-CONFIG: dict[str, Any] = json.loads(_cfg_path.read_text("utf-8-sig"))  # utf-8-sig: tollera il BOM di Blocco note
+CONFIG: dict[str, Any] = json.loads(_cfg_path.read_text("utf-8-sig"))  # utf-8-sig: tolerates the BOM Notepad adds
 
 
-def _richiesta(chiave: str) -> Any:
-    """Legge una chiave obbligatoria di config.json; se manca spiega quale, invece di fallire più avanti in modo oscuro."""
-    if chiave not in CONFIG:
-        sys.stderr.write(f"outlook-classic-mcp: in config.json manca la chiave obbligatoria \"{chiave}\" (vedi config.example.json).\n")
+def _required(key: str) -> Any:
+    """Reads a mandatory key of config.json; if it is missing, says which one instead of failing obscurely later."""
+    if key not in CONFIG:
+        sys.stderr.write(f"outlook-classic-mcp: config.json lacks the mandatory key \"{key}\" (see config.example.json).\n")
         sys.exit(1)
-    return CONFIG[chiave]
+    return CONFIG[key]
 
 
-# Fase attiva (1-4): limita gli strumenti disponibili, vedi richiede_fase().
-FASE = int(CONFIG.get("fase", 1))
-# Tempo massimo di attesa per una singola chiamata a Outlook. Se Outlook ha una finestra modale aperta (richiesta di
-# password, avviso) non risponde: meglio un errore spiegato che un blocco infinito.
-TIMEOUT = int(CONFIG.get("timeout_secondi", 40))
-# Lunghezza massima del corpo (mail, evento, nota, attività) restituito a Claude, per non saturare la conversazione.
-MAX_CORPO = int(CONFIG.get("max_caratteri_corpo", 20000))
-# Pause di cortesia: ogni chiamata COM gira sul filo principale di Outlook, lo stesso che disegna la finestra. Durante
-# una lettura lunga (centinaia di elementi) Outlook resterebbe bloccato per l'utente; una breve pausa ogni pochi elementi
-# gli lascia il tempo di rispondere ai clic. 0 = nessuna pausa. Valori sensati: 10-25 ms ogni 2-3 elementi.
-PAUSA_CORTESIA_MS = float(CONFIG.get("pausa_cortesia_ms", 10))
-PAUSA_OGNI = max(1, int(CONFIG.get("pausa_ogni_elementi", 3)))
-_pausa_cache = {"mtime": 0.0, "controllo": 0.0}
+# Active phase (1-4): limits which tools are available, see require_phase().
+PHASE = int(CONFIG.get("phase", 1))
+# Maximum wait for a single call into Outlook. When Outlook has a modal window open (password prompt, warning) it does
+# not answer: an explained error is better than a hang.
+TIMEOUT = int(CONFIG.get("timeout_seconds", 40))
+# Maximum length of a body (mail, event, note, task) returned to Claude, to keep the conversation light.
+MAX_BODY = int(CONFIG.get("max_body_chars", 20000))
+# Courtesy pauses: every COM call runs on Outlook's main thread, the one that paints the window. During a long read
+# (hundreds of items) Outlook would freeze for the user; a short pause every few items lets it answer clicks.
+# 0 = no pause. Sensible values: 10-25 ms every 2-3 items.
+COURTESY_PAUSE_MS = float(CONFIG.get("courtesy_pause_ms", 10))
+PAUSE_EVERY = max(1, int(CONFIG.get("pause_every_items", 3)))
+_pause_cache = {"mtime": 0.0, "checked": 0.0}
 
 
-def aggiorna_pause() -> None:
-    """Rilegge pausa_cortesia_ms e pausa_ogni_elementi da config.json se il file è cambiato (controllo al massimo
-    ogni 5 secondi): così si tarano senza riavviare il Claude desktop."""
-    global PAUSA_CORTESIA_MS, PAUSA_OGNI
-    adesso = time.time()
-    if adesso - _pausa_cache["controllo"] < 5:
+def refresh_pauses() -> None:
+    """Re-reads courtesy_pause_ms and pause_every_items from config.json when the file changed (checked at most every
+    5 seconds), so they can be tuned without restarting Claude desktop."""
+    global COURTESY_PAUSE_MS, PAUSE_EVERY
+    now = time.time()
+    if now - _pause_cache["checked"] < 5:
         return
-    _pausa_cache["controllo"] = adesso
+    _pause_cache["checked"] = now
     try:
         m = _cfg_path.stat().st_mtime
-        if m != _pausa_cache["mtime"]:
-            _pausa_cache["mtime"] = m
-            c = json.loads(_cfg_path.read_text("utf-8"))
-            PAUSA_CORTESIA_MS = float(c.get("pausa_cortesia_ms", 10))
-            PAUSA_OGNI = max(1, int(c.get("pausa_ogni_elementi", 3)))
+        if m != _pause_cache["mtime"]:
+            _pause_cache["mtime"] = m
+            c = json.loads(_cfg_path.read_text("utf-8-sig"))
+            COURTESY_PAUSE_MS = float(c.get("courtesy_pause_ms", 10))
+            PAUSE_EVERY = max(1, int(c.get("pause_every_items", 3)))
     except Exception:  # noqa: BLE001
         pass
 
-# Caselle: alias breve -> nome dell'archivio come compare in Outlook (Store.DisplayName, cioè il nome in grassetto
-# nel riquadro delle cartelle). Claude usa l'alias ("lavoro", "pec"...) e il connettore risolve l'archivio.
-# Se Claude passa un nome che non è un alias, viene provato come nome esatto di archivio.
-CASELLE: dict[str, str] = {str(k).lower(): str(v) for k, v in _richiesta("caselle").items()}
-CASELLA_PREDEFINITA = str(_richiesta("casella_predefinita")).lower()
-if CASELLA_PREDEFINITA not in CASELLE:
-    sys.stderr.write(f"outlook-classic-mcp: \"casella_predefinita\" ({CASELLA_PREDEFINITA}) non è fra gli alias di \"caselle\".\n")
+
+# Mailboxes: short alias -> name of the store as Outlook shows it (Store.DisplayName, the bold name at the top of each
+# account in the folder pane). Claude uses the alias ("work", "pec"...) and the server resolves the store.
+# If Claude passes a name that is not an alias, it is tried as the exact store name.
+MAILBOXES: dict[str, str] = {str(k).lower(): str(v) for k, v in _required("mailboxes").items()}
+DEFAULT_MAILBOX = str(_required("default_mailbox")).lower()
+if DEFAULT_MAILBOX not in MAILBOXES:
+    sys.stderr.write(f"outlook-classic-mcp: \"default_mailbox\" ({DEFAULT_MAILBOX}) is not one of the aliases in \"mailboxes\".\n")
     sys.exit(1)
 
-# Cancellazione (solo spostamento nel cestino della casella). Interruttore in config.json, spento se assente.
-CANCELLAZIONE = bool(CONFIG.get("cancellazione_abilitata", False))
+# Deletion (move to the mailbox trash only). Switch in config.json, off when absent.
+DELETION = bool(CONFIG.get("deletion_enabled", False))
 
-# Invio avvisi: UNICA eccezione alla regola "nessun invio". Mittente e destinatario vengono dalla configurazione e
-# NON sono parametri dello strumento: Claude non può scegliere a chi scrivere. La sezione è facoltativa: se manca,
-# invia_avviso rifiuta con un messaggio chiaro (utile a chi vuole un connettore che non invii proprio nulla).
-_avviso = CONFIG.get("avviso") or {}
-AVVISO_MITTENTE = str(_avviso.get("mittente", "")).strip().lower()      # indirizzo di un account presente in Outlook
-AVVISO_DESTINATARIO = str(_avviso.get("destinatario", "")).strip()      # l'unico destinatario possibile
-AVVISO_PREFISSO = str(_avviso.get("prefisso_oggetto", "[Avviso Claude] "))  # anteposto a ogni oggetto, per riconoscerli
+# Alerts: the ONLY exception to the "no sending" rule. Sender and recipient come from the configuration and are NOT
+# tool parameters: Claude cannot choose who receives them. The section is optional: when it is missing, send_alert
+# refuses with a clear message (handy for whoever wants a server that never sends anything at all).
+_alert = CONFIG.get("alert") or {}
+ALERT_SENDER = str(_alert.get("sender", "")).strip().lower()         # address of an account present in Outlook
+ALERT_RECIPIENT = str(_alert.get("recipient", "")).strip()           # the only possible recipient
+ALERT_PREFIX = str(_alert.get("subject_prefix", "[Claude alert] "))  # prepended to every subject, to recognise them
 
-# Cartelle in cui il connettore può scrivere file (allegati, .msg): mai altrove, mai sovrascrivendo.
-CARTELLE_SALVATAGGIO = [Path(p) for p in _richiesta("cartelle_salvataggio")]
-if not CARTELLE_SALVATAGGIO:
-    sys.stderr.write("outlook-classic-mcp: \"cartelle_salvataggio\" deve contenere almeno una cartella.\n")
+# Folders the server may write files to (attachments, .msg): nowhere else, never overwriting.
+SAVE_FOLDERS = [Path(p) for p in _required("save_folders")]
+if not SAVE_FOLDERS:
+    sys.stderr.write("outlook-classic-mcp: \"save_folders\" must contain at least one folder.\n")
     sys.exit(1)
 
-# Etichette colorate degli appuntamenti: proprietà MAPI "Label" (0x8214) dell'appuntamento, con i valori storici di
-# Outlook 2003/2007 (0 = nessuna ... 10 = telefonata). Outlook moderno non le mostra più nella sua interfaccia, ma
-# alcuni server le usano ancora: per esempio Kerio Connect (tramite KOFF) le mappa sulle proprie etichette colorate.
-# Su Exchange o IMAP vengono scritte e rilette senza effetti visibili: innocue.
-ETICHETTE: dict[str, int] = {
-    "nessuna": 0, "importante": 1, "lavoro": 2, "personale": 3, "vacanza": 4, "da_non_perdere": 5,
-    "viaggio": 6, "preparazione": 7, "compleanno": 8, "anniversario": 9, "telefonata": 10,
+# Coloured labels of appointments: the MAPI "Label" property (0x8214) with the historical Outlook 2003/2007 values
+# (0 = none ... 10 = phone call). Modern Outlook no longer shows them in its own UI, but some servers still use them:
+# Kerio Connect (through KOFF), for instance, maps them onto its coloured labels. On Exchange or IMAP they are written
+# and read back with no visible effect: harmless.
+LABELS: dict[str, int] = {
+    "none": 0, "important": 1, "business": 2, "personal": 3, "vacation": 4, "must_attend": 5,
+    "travel": 6, "needs_preparation": 7, "birthday": 8, "anniversary": 9, "phone_call": 10,
 }
-ETICHETTE_INV = {v: k for k, v in ETICHETTE.items()}
+LABELS_INV = {v: k for k, v in LABELS.items()}
 PROP_LABEL = "http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/82140003"
 
-# Registri: server.log (tecnico, con gli errori) e audit.log (una riga JSON per ogni scrittura: strumento, casella,
-# id, oggetto; mai il contenuto). Stanno in %LOCALAPPDATA%\outlook-classic-mcp, fuori dal repository.
+# Logs: server.log (technical, with errors) and audit.log (one JSON line per write: tool, mailbox, id, subject; never
+# the content). They live in %LOCALAPPDATA%\outlook-classic-mcp, outside the repository.
 LOGDIR = Path(os.environ.get("LOCALAPPDATA", str(BASE))) / "outlook-classic-mcp"
 LOGDIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -161,30 +157,30 @@ log = logging.getLogger("outlook-classic-mcp")
 AUDIT = LOGDIR / "audit.log"
 
 
-def audit(strumento: str, **campi: Any) -> None:
-    """Aggiunge una riga al registro delle scritture. Lo chiamano tutti gli strumenti che modificano qualcosa."""
-    riga = {"quando": dt.datetime.now().isoformat(timespec="seconds"), "strumento": strumento, **campi}
+def audit(tool: str, **fields: Any) -> None:
+    """Appends a line to the write log. Every tool that changes something calls it."""
+    row = {"when": dt.datetime.now().isoformat(timespec="seconds"), "tool": tool, **fields}
     with AUDIT.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(riga, ensure_ascii=False) + "\n")
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 # ----------------------------------------------------------------------------
-# Thread COM (STA): tutte le chiamate a Outlook passano di qui, una alla volta, con timeout.
+# COM thread (STA): every call into Outlook goes through here, one at a time, with a timeout.
 #
-# Perché: gli oggetti COM di Outlook vanno usati dal thread che li ha creati (modello "single-threaded apartment").
-# Il server MCP è asincrono (asyncio) e potrebbe servire più richieste; un solo thread dedicato con una coda garantisce
-# che Outlook riceva una chiamata alla volta, nell'ordine giusto, e che un blocco di Outlook non blocchi il server.
+# Why: Outlook COM objects must be used from the thread that created them (single-threaded apartment model). The MCP
+# server is asynchronous (asyncio) and may serve several requests; one dedicated thread with a queue guarantees that
+# Outlook receives one call at a time, in order, and that a frozen Outlook does not freeze the server.
 # ----------------------------------------------------------------------------
 
 class ComWorker:
     def __init__(self) -> None:
-        self.q: "queue.Queue[tuple[Any, dict]]" = queue.Queue()  # coda di lavori (funzione, "futuro")
-        self.app = None                                           # oggetto Outlook.Application, agganciato alla prima chiamata
+        self.q: "queue.Queue[tuple[Any, dict]]" = queue.Queue()  # job queue (function, "future")
+        self.app = None                                           # Outlook.Application object, attached on first call
         self.t = threading.Thread(target=self._loop, name="outlook-com", daemon=True)
         self.t.start()
 
     def _loop(self) -> None:
-        """Ciclo del thread COM: inizializza COM una volta sola, poi esegue i lavori uno dopo l'altro."""
+        """COM thread loop: initialises COM once, then runs the jobs one after the other."""
         pythoncom.CoInitialize()
         while True:
             fn, fut = self.q.get()
@@ -193,29 +189,29 @@ class ComWorker:
             except BaseException as e:  # noqa: BLE001
                 fut["e"] = e
             finally:
-                fut["ev"].set()  # sveglia chi aspetta in run()
+                fut["ev"].set()  # wake up whoever waits in run()
 
     def run(self, fn):
-        """Mette fn in coda e aspetta il risultato al massimo TIMEOUT secondi. Chiamata da un thread qualsiasi."""
+        """Queues fn and waits for its result for at most TIMEOUT seconds. Called from any thread."""
         fut: dict[str, Any] = {"ev": threading.Event()}
         self.q.put((fn, fut))
         if not fut["ev"].wait(TIMEOUT):
-            # Il lavoro resta in corso dentro Outlook: alla prossima chiamata la coda riparte da sola quando Outlook si libera.
+            # The job is still running inside Outlook: the queue resumes by itself once Outlook is free again.
             raise TimeoutError(
-                f"Outlook non risponde entro {TIMEOUT} s. Probabile finestra modale aperta in Outlook "
-                "(richiesta password, passphrase PGP, avviso): chiuderla e riprovare."
+                f"Outlook did not answer within {TIMEOUT} s. A modal window is probably open in Outlook "
+                "(password prompt, PGP passphrase, warning): close it and try again."
             )
         if "e" in fut:
             raise fut["e"]
         return fut["r"]
 
     def outlook(self):
-        """Si aggancia alla sessione di Outlook già aperta (GetActiveObject). Non avvia Outlook e non chiede credenziali.
-        GetActiveObject fallisce se Outlook è chiuso, se è ancora in avvio con una finestra davanti, oppure se gira con
-        privilegi diversi da quelli di questo processo (per esempio Outlook "come amministratore")."""
+        """Attaches to the Outlook session that is already open (GetActiveObject). Never starts Outlook, never asks
+        for credentials. GetActiveObject fails when Outlook is closed, still starting with a dialog in front, or running
+        with different privileges than this process (for example Outlook "as administrator")."""
         if self.app is not None:
             try:
-                _ = self.app.Version  # Outlook è ancora vivo? Se è stato chiuso, l'oggetto è morto e si riaggancia.
+                _ = self.app.Version  # still alive? If Outlook was closed the object is dead: re-attach.
                 return self.app
             except Exception:  # noqa: BLE001
                 self.app = None
@@ -223,8 +219,8 @@ class ComWorker:
             self.app = win32com.client.GetActiveObject("Outlook.Application")
         except pythoncom.com_error as e:
             raise RuntimeError(
-                "Outlook Classic non risulta aperto (o è aperto come amministratore). "
-                f"Aprire Outlook e riprovare. Dettaglio: {e}"
+                "Classic Outlook does not appear to be running (or it runs as administrator). "
+                f"Open Outlook and try again. Detail: {e}"
             ) from e
         return self.app
 
@@ -233,92 +229,97 @@ COM = ComWorker()
 
 
 async def com(fn):
-    """Ponte fra il mondo asincrono del server MCP e il thread COM: esegue fn là e aspetta senza bloccare asyncio.
-    Ogni errore arriva a Claude come ToolError con un messaggio comprensibile, mai come 'Error executing tool' anonimo:
-    così Claude sa spiegare all'utente cosa è andato storto (casella sbagliata, Outlook chiuso, data non valida...)."""
+    """Bridge between the asynchronous MCP server and the COM thread: runs fn there and waits without blocking asyncio.
+    Every error reaches Claude as a ToolError with a readable message, never as an anonymous 'Error executing tool':
+    this way Claude can tell the user what went wrong (wrong mailbox, Outlook closed, invalid date...)."""
     try:
         return await asyncio.to_thread(COM.run, fn)
     except ToolError:
         raise
     except pywintypes.com_error as e:
-        # excepinfo[2] contiene il testo dell'errore di Outlook, quando c'è
-        dettaglio = e.excepinfo[2] if getattr(e, "excepinfo", None) and len(e.excepinfo) > 2 and e.excepinfo[2] else str(e)
-        log.exception("Errore COM")
-        raise ToolError(f"Outlook ha risposto con un errore: {dettaglio}") from e
+        # excepinfo[2] holds Outlook's own error text, when there is one
+        detail = e.excepinfo[2] if getattr(e, "excepinfo", None) and len(e.excepinfo) > 2 and e.excepinfo[2] else str(e)
+        log.exception("COM error")
+        raise ToolError(f"Outlook returned an error: {detail}") from e
     except Exception as e:  # noqa: BLE001
-        log.exception("Errore")
+        log.exception("Error")
         raise ToolError(f"{type(e).__name__}: {e}") from e
 
 
 # ----------------------------------------------------------------------------
-# Utilità: navigazione fra archivi e cartelle, date, formattazione dei risultati
+# Helpers: navigating stores and folders, dates, result formatting
 # ----------------------------------------------------------------------------
 
-def richiede_fase(n: int) -> None:
-    """Blocca uno strumento se la fase configurata è più bassa di quella richiesta."""
-    if FASE < n:
-        raise ToolError(f"Funzione non abilitata: richiede la fase {n}, il connettore è in fase {FASE} (config.json).")
+def require_phase(n: int) -> None:
+    """Blocks a tool when the configured phase is lower than the one it needs."""
+    if PHASE < n:
+        raise ToolError(f"Tool not enabled: it needs phase {n}, the server runs in phase {PHASE} (config.json).")
 
 
 def ns():
-    """Il NameSpace MAPI: la radice da cui si raggiungono archivi (Stores), account e singoli elementi (GetItemFromID)."""
+    """The MAPI NameSpace: the root from which stores, accounts and single items (GetItemFromID) are reached."""
     return COM.outlook().GetNamespace("MAPI")
 
 
-def store_da_alias(alias: str | None):
-    """Dall'alias di config.json (o dal nome esatto dell'archivio) all'oggetto Store di Outlook. Vuoto = casella predefinita."""
-    alias = (alias or CASELLA_PREDEFINITA).strip()
-    nome = CASELLE.get(alias.lower(), alias)
+def store_from_alias(alias: str | None):
+    """From a config.json alias (or the exact store name) to the Outlook Store object. Empty = default mailbox."""
+    alias = (alias or DEFAULT_MAILBOX).strip()
+    name = MAILBOXES.get(alias.lower(), alias)
     for s in ns().Stores:
-        if s.DisplayName == nome:
+        if s.DisplayName == name:
             return s
-    raise ValueError(f"Casella '{alias}' non trovata. Caselle note: {', '.join(CASELLE)} (oppure il nome esatto dell'archivio).")
+    raise ValueError(f"Mailbox '{alias}' not found. Known mailboxes: {', '.join(MAILBOXES)} (or the exact store name).")
 
 
-def cartella_da_percorso(store, percorso: str | None):
-    """Percorso relativo alla radice dell'archivio, con '/' (o '\\') fra i livelli, senza distinzione fra maiuscole e
-    minuscole. Vuoto = radice dell'archivio. Esempio: 'Posta in arrivo/Clienti/Rossi'."""
+def folder_from_path(store, path: str | None):
+    """Path relative to the store root, with '/' (or '\\') between levels, case-insensitive. Empty = store root.
+    Example: 'Inbox/Customers/Smith'."""
     f = store.GetRootFolder()
-    for parte in [p for p in re.split(r"[\\/]", percorso or "") if p]:
-        trovata = None
+    for part in [p for p in re.split(r"[\\/]", path or "") if p]:
+        found = None
         for sub in f.Folders:
-            if sub.Name.lower() == parte.lower():
-                trovata = sub
+            if sub.Name.lower() == part.lower():
+                found = sub
                 break
-        if trovata is None:
-            raise ValueError(f"Cartella '{parte}' non trovata in '{f.FolderPath}'.")
-        f = trovata
+        if found is None:
+            raise ValueError(f"Folder '{part}' not found in '{f.FolderPath}'.")
+        f = found
     return f
 
 
-def posta_in_arrivo(store):
-    """La Posta in arrivo dell'archivio: cartella predefinita 6 (olFolderInbox); in mancanza, cerca per nome."""
+def default_folder(store, code: int, *names: str):
+    """Default folder of a store (GetDefaultFolder); if the provider does not declare it, looks it up by name
+    (English and localised names are tried in order). Useful codes: 6 Inbox, 16 Drafts, 9 Calendar, 10 Contacts,
+    13 Tasks, 12 Notes, 3 Deleted Items."""
     try:
-        return store.GetDefaultFolder(6)
+        return store.GetDefaultFolder(code)
     except Exception:  # noqa: BLE001
+        pass
+    last: Exception | None = None
+    for n in names:
         try:
-            return cartella_da_percorso(store, "Posta in arrivo")
-        except ValueError:
-            return cartella_da_percorso(store, "Inbox")
+            return folder_from_path(store, n)
+        except ValueError as ex:
+            last = ex
+    raise last or ValueError("Default folder not found.")
 
 
-def calendario(store, nome: str | None):
-    """Il Calendario dell'archivio (cartella predefinita 9, olFolderCalendar) oppure, con 'nome', un altro calendario
-    raggiunto per percorso. Rifiuta qualunque cartella che non sia di calendario: un evento non deve mai finire in Bozze
-    o in una cartella di posta (alcuni server lo trasformerebbero in un messaggio)."""
-    if nome:
-        cal = cartella_da_percorso(store, nome)
-    else:
-        try:
-            cal = store.GetDefaultFolder(9)
-        except Exception:  # noqa: BLE001
-            try:
-                cal = cartella_da_percorso(store, "Calendario")
-            except ValueError:
-                cal = cartella_da_percorso(store, "Calendar")
+def inbox(store):
+    return default_folder(store, 6, "Inbox", "Posta in arrivo", "Posteingang", "Boîte de réception", "Bandeja de entrada")
+
+
+def drafts(store):
+    return default_folder(store, 16, "Drafts", "Bozze", "Entwürfe", "Brouillons", "Borradores")
+
+
+def calendar(store, name: str | None):
+    """The store's Calendar (default folder 9) or, with 'name', another calendar reached by path. Refuses any folder
+    that is not a calendar folder: an event must never end up in Drafts or in a mail folder (some servers would turn
+    it into a message)."""
+    cal = folder_from_path(store, name) if name else default_folder(store, 9, "Calendar", "Calendario", "Kalender", "Calendrier")
     try:
         if cal.DefaultItemType != 1:
-            raise ValueError(f"'{cal.FolderPath}' non è una cartella di calendario: un evento si crea solo nel Calendario, mai in Bozze o in una cartella di posta.")
+            raise ValueError(f"'{cal.FolderPath}' is not a calendar folder: an event is created only in a Calendar, never in Drafts or in a mail folder.")
     except ValueError:
         raise
     except Exception:  # noqa: BLE001
@@ -326,48 +327,37 @@ def calendario(store, nome: str | None):
     return cal
 
 
-def verifica_evento_puro(e, cal_path: str | None = None) -> None:
-    """Regola assoluta: un evento o memo è sempre un appuntamento semplice nel Calendario, mai una riunione con
-    invitati (che Outlook tratterebbe come invito da spedire o disdire) e mai un elemento in Bozze o in posta.
-    I controlli sono tolleranti: se una proprietà non è leggibile si passa oltre, se è leggibile e sbagliata si rifiuta."""
+def check_plain_appointment(e) -> None:
+    """Absolute rule: an event or memo is always a plain appointment in a Calendar, never a meeting with attendees
+    (Outlook would treat it as an invitation to send or cancel) and never an item in Drafts or in mail.
+    The checks are tolerant: an unreadable property is skipped, a readable wrong one is refused."""
     try:
         if int(e.MeetingStatus) != 0:
-            raise ValueError("L'elemento è una riunione con invitati: il connettore non crea né modifica inviti. Va gestito a mano dall'utente in Outlook.")
+            raise ValueError("The item is a meeting with attendees: this server neither creates nor edits invitations. The user handles it in Outlook.")
     except ValueError:
         raise
     except Exception:  # noqa: BLE001
         pass
     try:
         if (e.RequiredAttendees or "").strip() or (e.OptionalAttendees or "").strip():
-            raise ValueError("L'elemento ha dei partecipanti: il connettore non crea né modifica inviti.")
+            raise ValueError("The item has attendees: this server neither creates nor edits invitations.")
     except ValueError:
         raise
     except Exception:  # noqa: BLE001
         pass
     try:
-        padre = e.Parent
-        if padre.DefaultItemType != 1:
-            raise ValueError(f"L'evento sta in '{padre.FolderPath}', che non è un calendario: operazione rifiutata.")
+        parent = e.Parent
+        if parent.DefaultItemType != 1:
+            raise ValueError(f"The event sits in '{parent.FolderPath}', which is not a calendar: operation refused.")
     except ValueError:
         raise
     except Exception:  # noqa: BLE001
         pass
 
 
-def bozze(store):
-    """La cartella Bozze dell'archivio (cartella predefinita 16, olFolderDrafts); in mancanza, cerca per nome."""
-    try:
-        return store.GetDefaultFolder(16)
-    except Exception:  # noqa: BLE001
-        try:
-            return cartella_da_percorso(store, "Bozze")
-        except ValueError:
-            return cartella_da_percorso(store, "Drafts")
-
-
-def account_per_store(store):
-    """L'account di Outlook che consegna in questo archivio: serve per impostare SendUsingAccount sulle bozze, così la
-    bozza nasce già con il mittente giusto. Può non esistere (archivi PST, cartelle pubbliche): allora None."""
+def account_for_store(store):
+    """The Outlook account that delivers into this store: used to set SendUsingAccount on drafts so that the draft is
+    born with the right sender. May not exist (PST stores, public folders): then None."""
     for a in ns().Accounts:
         try:
             if a.DeliveryStore is not None and a.DeliveryStore.StoreID == store.StoreID:
@@ -377,18 +367,18 @@ def account_per_store(store):
     return None
 
 
-def elemento(id_: str, casella: str | None):
-    """Dall'id (EntryID) restituito dagli elenchi all'oggetto Outlook (mail, evento, contatto...). Restituisce anche
-    lo Store, che serve a chi deve trovare Bozze o cestino della stessa casella."""
-    store = store_da_alias(casella)
+def item_by_id(id_: str, mailbox: str | None):
+    """From the id (EntryID) returned by the listings to the Outlook object (mail, event, contact...). Also returns
+    the Store, needed by callers that must find the Drafts or the trash of the same mailbox."""
+    store = store_from_alias(mailbox)
     try:
         return ns().GetItemFromID(id_, store.StoreID), store
     except pythoncom.com_error as e:
-        raise ValueError(f"Elemento non trovato nella casella '{casella or CASELLA_PREDEFINITA}' (id non valido o elemento spostato). {e}") from e
+        raise ValueError(f"Item not found in mailbox '{mailbox or DEFAULT_MAILBOX}' (invalid id or item moved). {e}") from e
 
 
 def fmt(d) -> str | None:
-    """Data COM di Outlook -> testo 'AAAA-MM-GGTHH:MM' (ora locale), il formato usato in tutte le risposte."""
+    """Outlook COM date -> text 'YYYY-MM-DDTHH:MM' (local time), the format used in every answer."""
     if d is None:
         return None
     try:
@@ -397,46 +387,46 @@ def fmt(d) -> str | None:
         return str(d)
 
 
-def parse_dt(s: str | None, fine_giornata: bool = False) -> dt.datetime | None:
-    """Testo -> datetime. Accetta 'AAAA-MM-GG', 'AAAA-MM-GG HH:MM', 'AAAA-MM-GGTHH:MM'. Con fine_giornata una data
-    senza ora diventa le 23:59:59 (utile come limite superiore di un intervallo)."""
+def parse_dt(s: str | None, end_of_day: bool = False) -> dt.datetime | None:
+    """Text -> datetime. Accepts 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM'. With end_of_day a date without
+    time becomes 23:59:59 (useful as the upper bound of a range)."""
     if not s:
         return None
     s = s.strip().replace("T", " ")
     for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             d = dt.datetime.strptime(s, f)
-            if f == "%Y-%m-%d" and fine_giornata:
+            if f == "%Y-%m-%d" and end_of_day:
                 d = d.replace(hour=23, minute=59, second=59)
             return d
         except ValueError:
             continue
-    raise ValueError(f"Data non riconosciuta: '{s}'. Usare AAAA-MM-GG oppure AAAA-MM-GG HH:MM.")
+    raise ValueError(f"Unrecognised date: '{s}'. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.")
 
 
-def dasl_data(d: dt.datetime) -> str:
-    """Data per i filtri DASL (Items.Restrict con '@SQL=...'): Outlook la confronta in UTC e nel formato ISO,
-    indipendentemente dalla lingua di Windows. Lezione imparata: il formato Jet classico ('[ReceivedTime] >= 'MM/dd/yyyy'')
-    viene interpretato con le impostazioni regionali del PC e su un Windows italiano scambia giorno e mese."""
-    locale_tz = dt.datetime.now().astimezone().tzinfo
-    return d.replace(tzinfo=locale_tz).astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+def dasl_date(d: dt.datetime) -> str:
+    """Date for DASL filters (Items.Restrict with '@SQL=...'): Outlook compares it in UTC and ISO format, regardless of
+    the Windows language. Lesson learned: the classic Jet format ("[ReceivedTime] >= 'MM/dd/yyyy'") is parsed with the
+    PC's regional settings and on a non-US Windows swaps day and month."""
+    local_tz = dt.datetime.now().astimezone().tzinfo
+    return d.replace(tzinfo=local_tz).astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def com_data(d: dt.datetime):
-    """Data da scrivere in una proprietà di Outlook (Start, End, DueDate...). Outlook vuole l'ora locale "di parete";
-    pywin32 converte una datetime senza fuso da ora locale a UTC, spostandola (di un'ora in Italia). Marcandola come UTC
-    passa invariata e Outlook la legge come ora locale: è il comportamento che ci si aspetta scrivendo '2026-11-09 16:00'."""
+def com_date(d: dt.datetime):
+    """Date to write into an Outlook property (Start, End, DueDate...). Outlook wants local "wall clock" time; pywin32
+    converts a naive datetime from local time to UTC, shifting it. Marked as UTC it reaches Outlook unchanged and is
+    read as local time, which is what one expects when writing '2026-11-09 16:00'."""
     return pywintypes.Time(d.replace(tzinfo=dt.timezone.utc))
 
 
 def dasl_lit(s: str) -> str:
-    """Testo dentro un filtro DASL: l'apice si raddoppia, come in SQL."""
+    """Text inside a DASL filter: the quote is doubled, as in SQL."""
     return s.replace("'", "''")
 
 
-def smtp_mittente(item) -> str:
-    """Indirizzo SMTP del mittente. Con Exchange SenderEmailAddress è un indirizzo X.500 illeggibile: in quel caso si
-    passa da GetExchangeUser per avere l'indirizzo vero."""
+def sender_smtp(item) -> str:
+    """SMTP address of the sender. With Exchange, SenderEmailAddress is an unreadable X.500 address: in that case the
+    real address comes from GetExchangeUser."""
     try:
         addr = item.SenderEmailAddress or ""
         if item.SenderEmailType == "EX":
@@ -451,63 +441,63 @@ def smtp_mittente(item) -> str:
         return ""
 
 
-def meta_mail(item, alias: str) -> dict[str, Any]:
-    """I metadati di una mail come li vede Claude negli elenchi: id, oggetto, mittente, data, letta o no, numero di
-    allegati, cartella. Mai il corpo: quello si chiede a parte con leggi_mail, così gli elenchi restano leggeri."""
-    d: dict[str, Any] = {"id": item.EntryID, "casella": alias}
-    for chiave, attr in (("oggetto", "Subject"), ("non_letta", "UnRead"), ("a", "To"), ("cc", "CC")):
+def mail_meta(item, alias: str) -> dict[str, Any]:
+    """The metadata of a mail as Claude sees it in listings: id, subject, sender, date, unread flag, attachment count,
+    folder. Never the body: that is requested separately with read_mail, so listings stay light."""
+    d: dict[str, Any] = {"id": item.EntryID, "mailbox": alias}
+    for key, attr in (("subject", "Subject"), ("unread", "UnRead"), ("to", "To"), ("cc", "CC")):
         try:
             v = getattr(item, attr)
-            d[chiave] = v.strip() if isinstance(v, str) else v
+            d[key] = v.strip() if isinstance(v, str) else v
         except Exception:  # noqa: BLE001
-            d[chiave] = None
+            d[key] = None
     try:
-        d["data"] = fmt(item.ReceivedTime)
+        d["date"] = fmt(item.ReceivedTime)
     except Exception:  # noqa: BLE001
-        d["data"] = None
+        d["date"] = None
     try:
-        d["da"] = f"{item.SenderName} <{smtp_mittente(item)}>"
+        d["from"] = f"{item.SenderName} <{sender_smtp(item)}>"
     except Exception:  # noqa: BLE001
-        d["da"] = None
+        d["from"] = None
     try:
-        d["allegati"] = item.Attachments.Count
+        d["attachments"] = item.Attachments.Count
     except Exception:  # noqa: BLE001
-        d["allegati"] = 0
+        d["attachments"] = 0
     try:
-        d["dimensione"] = item.Size
+        d["size"] = item.Size
     except Exception:  # noqa: BLE001
         pass
     try:
-        d["cartella"] = item.Parent.FolderPath
+        d["folder"] = item.Parent.FolderPath
     except Exception:  # noqa: BLE001
         pass
     return d
 
 
-def respira(n: int) -> None:
-    """Pausa di cortesia: chiamata con il contatore degli elementi lavorati; dorme ogni PAUSA_OGNI elementi."""
-    if PAUSA_CORTESIA_MS > 0 and n % PAUSA_OGNI == 0:
-        time.sleep(PAUSA_CORTESIA_MS / 1000.0)
+def breathe(n: int) -> None:
+    """Courtesy pause: called with the count of processed items; sleeps every PAUSE_EVERY items."""
+    if COURTESY_PAUSE_MS > 0 and n % PAUSE_EVERY == 0:
+        time.sleep(COURTESY_PAUSE_MS / 1000.0)
 
 
-def itera(items, massimo: int):
-    """Itera una collezione Items con GetFirst/GetNext, al massimo 'massimo' elementi, con pause di cortesia.
-    GetFirst/GetNext è più veloce dell'accesso per indice (items[i]) con i provider che non tengono tutto in cache."""
-    aggiorna_pause()
+def iterate(items, limit: int):
+    """Iterates an Items collection with GetFirst/GetNext, at most 'limit' items, with courtesy pauses.
+    GetFirst/GetNext is faster than index access (items[i]) with providers that do not cache everything."""
+    refresh_pauses()
     n = 0
     it = items.GetFirst()
-    while it is not None and n < massimo:
+    while it is not None and n < limit:
         yield it
         n += 1
-        respira(n)
+        breathe(n)
         it = items.GetNext()
 
 
-def percorso_consentito(p: Path) -> bool:
-    """True se p sta dentro una delle cartelle_salvataggio di config.json. resolve() normalizza '..' e collegamenti,
-    così non si esce dalla cartella consentita con trucchi di percorso."""
+def path_allowed(p: Path) -> bool:
+    """True when p lies inside one of the save_folders of config.json. resolve() normalises '..' and links, so path
+    tricks cannot escape the allowed folder."""
     p = p.resolve()
-    for root in CARTELLE_SALVATAGGIO:
+    for root in SAVE_FOLDERS:
         try:
             p.relative_to(root.resolve())
             return True
@@ -516,35 +506,35 @@ def percorso_consentito(p: Path) -> bool:
     return False
 
 
-def nome_libero(cartella: Path, nome: str) -> Path:
-    """Un nome di file non ancora usato nella cartella: se 'nome' esiste già si aggiunge ' (1)', ' (2)'... Il connettore
-    non sovrascrive mai niente. Un nome è occupato anche se esiste soltanto la sua impronta '<nome>.sha256'."""
-    base = Path(nome).name or "allegato"
-    dest = cartella / base
+def free_name(folder: Path, name: str) -> Path:
+    """A file name not yet used in the folder: if 'name' exists, ' (1)', ' (2)'... is appended. The server never
+    overwrites anything. A name counts as taken even if only its fingerprint '<name>.sha256' exists."""
+    base = Path(name).name or "attachment"
+    dest = folder / base
     i = 1
     while dest.exists() or dest.with_name(dest.name + ".sha256").exists():
-        dest = cartella / f"{Path(base).stem} ({i}){Path(base).suffix}"
+        dest = folder / f"{Path(base).stem} ({i}){Path(base).suffix}"
         i += 1
     return dest
 
 
-# Proprietà MAPI PR_TRANSPORT_MESSAGE_HEADERS: le intestazioni Internet complete (Received, Authentication-Results,
-# DKIM-Signature, Return-Path...), quelle che servono per controllare SPF, DKIM e DMARC di una mail sospetta.
-PROP_INTESTAZIONI = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
-OL_MSG_UNICODE = 9  # OlSaveAsType.olMSGUnicode: formato .msg con testo Unicode (gli accenti si conservano)
-_RE_NOME_VIETATO = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')  # caratteri che Windows non accetta in un nome di file
+# MAPI property PR_TRANSPORT_MESSAGE_HEADERS: the full Internet headers (Received, Authentication-Results,
+# DKIM-Signature, Return-Path...), the ones needed to check SPF, DKIM and DMARC on a suspicious mail.
+PROP_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
+OL_MSG_UNICODE = 9  # OlSaveAsType.olMSGUnicode: .msg format with Unicode text (accents survive)
+_RE_FORBIDDEN_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')  # characters Windows refuses in a file name
 
 
-def nome_da_oggetto(oggetto: str, massimo: int = 80) -> str:
-    """Oggetto ripulito per un nome di file Windows: niente caratteri vietati, spazi compattati, lunghezza limitata."""
-    s = _RE_NOME_VIETATO.sub(" ", oggetto or "")
+def name_from_subject(subject: str, limit: int = 80) -> str:
+    """Subject cleaned up into a Windows file name: no forbidden characters, collapsed spaces, bounded length."""
+    s = _RE_FORBIDDEN_NAME.sub(" ", subject or "")
     s = re.sub(r"\s+", " ", s).strip()
-    s = s[:massimo].rstrip(" .")
-    return s or "senza oggetto"
+    s = s[:limit].rstrip(" .")
+    return s or "no subject"
 
 
-def data_per_nome(item) -> str:
-    """AAAA-MM-GG_HHMM dalla data di ricezione; per le bozze (mai ricevute) dalla data di creazione."""
+def date_for_name(item) -> str:
+    """YYYY-MM-DD_HHMM from the received time; for drafts (never received) from the creation time."""
     for attr in ("ReceivedTime", "CreationTime"):
         try:
             d = getattr(item, attr)
@@ -555,642 +545,632 @@ def data_per_nome(item) -> str:
     return dt.datetime.now().strftime("%Y-%m-%d_%H%M")
 
 
-def impronta_sha256(file: Path, **contesto: Any) -> dict[str, str]:
-    """Calcola lo SHA-256 del file appena salvato e scrive accanto '<file>.sha256' (catena di custodia: dimostra che
-    il file non è cambiato da quando è stato estratto da Outlook).
-    Formato: righe di commento '#' con data e ora di acquisizione e contesto, poi la riga standard
-    '<impronta>  <nome file>', verificabile con 'sha256sum -c' (che salta i commenti) o confrontando Get-FileHash.
-    Il file .sha256 non viene mai sovrascritto (apertura in modo 'x')."""
+def sha256_fingerprint(file: Path, **context: Any) -> dict[str, str]:
+    """Computes the SHA-256 of the file just saved and writes '<file>.sha256' next to it (chain of custody: proves the
+    file has not changed since it was extracted from Outlook).
+    Format: '#' comment lines with acquisition date/time and context, then the standard line
+    '<digest>  <file name>', verifiable with 'sha256sum -c' (which skips comments) or by comparing Get-FileHash.
+    The .sha256 file is never overwritten (mode 'x')."""
     h = hashlib.sha256()
     with file.open("rb") as fh:
-        for blocco in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(blocco)
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
     hexd = h.hexdigest()
-    acquisito = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    righe = ["# Impronta SHA-256 per la catena di custodia (outlook-classic-mcp)",
+    acquired = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    lines = ["# SHA-256 fingerprint for chain of custody (outlook-classic-mcp)",
              f"# file: {file.name}",
-             f"# dimensione_byte: {file.stat().st_size}",
-             f"# acquisito: {acquisito}",
-             "# postazione: " + os.environ.get("COMPUTERNAME", "")]
-    for k, v in contesto.items():
-        righe.append(f"# {k}: {str(v).replace(chr(10), ' ').replace(chr(13), ' ')}")
-    righe.append(f"{hexd}  {file.name}")
-    f_imp = file.with_name(file.name + ".sha256")
-    with f_imp.open("x", encoding="utf-8", newline="\n") as fh:
-        fh.write("\n".join(righe) + "\n")
-    return {"sha256": hexd, "file_sha256": str(f_imp), "acquisito": acquisito}
+             f"# size_bytes: {file.stat().st_size}",
+             f"# acquired: {acquired}",
+             "# workstation: " + os.environ.get("COMPUTERNAME", "")]
+    for k, v in context.items():
+        lines.append(f"# {k}: {str(v).replace(chr(10), ' ').replace(chr(13), ' ')}")
+    lines.append(f"{hexd}  {file.name}")
+    f_fp = file.with_name(file.name + ".sha256")
+    with f_fp.open("x", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return {"sha256": hexd, "sha256_file": str(f_fp), "acquired": acquired}
 
 
-def testo_a_html(testo: str) -> str:
-    """Testo semplice -> HTML minimo (caratteri speciali protetti, a capo come <br>). Tutte le bozze passano da HTML,
-    vedi crea_bozza per il motivo."""
-    return "<div style=\"font-family:Calibri,sans-serif;font-size:11pt\">" + htmlmod.escape(testo).replace("\n", "<br>") + "</div>"
+def text_to_html(text: str) -> str:
+    """Plain text -> minimal HTML (special characters escaped, newlines as <br>). Every draft goes through HTML, see
+    create_draft for the reason."""
+    return "<div style=\"font-family:Calibri,sans-serif;font-size:11pt\">" + htmlmod.escape(text).replace("\n", "<br>") + "</div>"
 
 
-UTF8_CPID = 65001  # pagina di codice UTF-8 per MailItem.InternetCodepage
+UTF8_CPID = 65001  # UTF-8 code page for MailItem.InternetCodepage
 _RE_META_CHARSET = re.compile(r"<meta[^>]*charset[^>]*>", re.I)
 _RE_BODY_OPEN = re.compile(r"<body[^>]*>", re.I)
 
 
-def forza_utf8(item) -> None:
-    """Imposta la pagina di codice UTF-8 sull'elemento PRIMA di scrivere HTMLBody.
-    Senza questo Outlook può ricodificare il testo con la pagina di codice dell'originale (per esempio Windows-1252)
-    e le lettere accentate arrivano come 'Ã ' o simili."""
+def force_utf8(item) -> None:
+    """Sets the UTF-8 code page on the item BEFORE writing HTMLBody. Without it Outlook may re-encode the text with the
+    original's code page (Windows-1252, say) and accented letters arrive as 'Ã ' and the like."""
     try:
         item.InternetCodepage = UTF8_CPID
     except Exception:  # noqa: BLE001
         pass
 
 
-def html_con_testo_in_testa(html_esistente: str, testo_html: str) -> str:
-    """Inserisce testo_html subito dopo <body> dell'HTML esistente (la citazione dell'originale in una risposta),
-    togliendo i <meta charset> che Outlook userebbe per ricodificare il contenuto. Se non c'è <body>, lo mette in testa."""
-    base = _RE_META_CHARSET.sub("", html_esistente or "")
+def html_with_text_on_top(existing_html: str, text_html: str) -> str:
+    """Inserts text_html right after <body> of the existing HTML (the quoted original in a reply), removing the
+    <meta charset> tags Outlook would use to re-encode the content. Without <body>, puts it on top."""
+    base = _RE_META_CHARSET.sub("", existing_html or "")
     m = _RE_BODY_OPEN.search(base)
     if m:
-        return base[:m.end()] + testo_html + "<br>" + base[m.end():]
-    return testo_html + "<br>" + base
+        return base[:m.end()] + text_html + "<br>" + base[m.end():]
+    return text_html + "<br>" + base
 
 
-def meta_evento(e, alias: str, cal_path: str | None = None) -> dict[str, Any]:
-    """I metadati di un appuntamento per gli elenchi: id, oggetto, luogo, inizio, fine, durata, ricorrente o no,
-    etichetta colorata, categorie, promemoria. La descrizione si legge a parte con leggi_evento."""
-    d: dict[str, Any] = {"casella": alias}
+def event_meta(e, alias: str, cal_path: str | None = None) -> dict[str, Any]:
+    """The metadata of an appointment for listings: id, subject, location, start, end, duration, recurring flag,
+    coloured label, categories, reminder. The description is read separately with read_event."""
+    d: dict[str, Any] = {"mailbox": alias}
     try:
         d["id"] = e.EntryID
     except Exception as ex:  # noqa: BLE001
-        # Occorrenza di una serie modificata che Outlook non sa più risolvere: si segnala e si va avanti.
+        # A modified occurrence of a series Outlook can no longer resolve: flag it and carry on.
         d["id"] = None
-        d["avviso"] = "occorrenza non leggibile: " + (ex.excepinfo[2] if getattr(ex, "excepinfo", None) and len(ex.excepinfo) > 2 and ex.excepinfo[2] else str(ex))
-    for chiave, attr in (("oggetto", "Subject"), ("luogo", "Location"), ("tutto_il_giorno", "AllDayEvent"),
-                         ("durata_minuti", "Duration"), ("categorie", "Categories"), ("ricorrente", "IsRecurring"),
-                         ("promemoria", "ReminderSet")):
+        d["warning"] = "unreadable occurrence: " + (ex.excepinfo[2] if getattr(ex, "excepinfo", None) and len(ex.excepinfo) > 2 and ex.excepinfo[2] else str(ex))
+    for key, attr in (("subject", "Subject"), ("location", "Location"), ("all_day", "AllDayEvent"),
+                      ("duration_minutes", "Duration"), ("categories", "Categories"), ("recurring", "IsRecurring"),
+                      ("reminder", "ReminderSet")):
         try:
-            d[chiave] = getattr(e, attr)
+            d[key] = getattr(e, attr)
         except Exception:  # noqa: BLE001
-            d[chiave] = None
+            d[key] = None
     try:
-        d["inizio"] = fmt(e.Start)
-        d["fine"] = fmt(e.End)
+        d["start"] = fmt(e.Start)
+        d["end"] = fmt(e.End)
     except Exception:  # noqa: BLE001
         pass
     try:
         lbl = int(e.PropertyAccessor.GetProperty(PROP_LABEL))
-        d["etichetta"] = ETICHETTE_INV.get(lbl, str(lbl))
+        d["label"] = LABELS_INV.get(lbl, str(lbl))
     except Exception:  # noqa: BLE001
-        d["etichetta"] = None
+        d["label"] = None
     if cal_path:
-        d["calendario"] = cal_path
+        d["calendar"] = cal_path
     return d
 
 
-
 # ----------------------------------------------------------------------------
-# Utilità per rubrica, attività, note, cartelle
+# Helpers for contacts, tasks, notes, folders
 # ----------------------------------------------------------------------------
 
-# Codici OlObjectClass degli elementi: servono a verificare che un id indichi davvero il tipo atteso.
-CLASSI = {43: "mail", 26: "evento", 40: "contatto", 48: "attivita", 44: "nota", 46: "rapporto", 53: "riunione"}
-# Codici OlItemType delle cartelle (Folder.DefaultItemType).
-TIPI_CARTELLA = {0: "posta", 1: "calendario", 2: "contatti", 3: "attivita", 4: "diario", 5: "note"}
-# Nomi con cui i vari provider chiamano il cestino (italiano e inglese): per riconoscerlo anche su IMAP e PEC.
-NOMI_CESTINO = {"posta eliminata", "deleted items", "cestino", "trash", "elementi eliminati"}
+# OlObjectClass codes of items: used to check that an id really points to the expected kind.
+CLASSES = {43: "mail", 26: "event", 40: "contact", 48: "task", 44: "note", 46: "report", 53: "meeting"}
+# OlItemType codes of folders (Folder.DefaultItemType).
+FOLDER_TYPES = {0: "mail", 1: "calendar", 2: "contacts", 3: "tasks", 4: "journal", 5: "notes"}
+# Names the various providers give the trash, in several languages: to recognise it on IMAP too.
+TRASH_NAMES = {"deleted items", "trash", "posta eliminata", "cestino", "elementi eliminati", "gelöschte elemente",
+               "papierkorb", "éléments supprimés", "corbeille", "elementos eliminados", "papelera"}
 
 
-def cartella_predefinita(store, codice: int, nome_it: str, nome_en: str):
-    """Cartella predefinita di un archivio (GetDefaultFolder); se il provider non la dichiara, la cerca per nome
-    italiano e poi inglese. Codici utili: 13 = Attività, 12 = Note, 10 = Contatti, 3 = Posta eliminata."""
-    try:
-        return store.GetDefaultFolder(codice)
-    except Exception:  # noqa: BLE001
-        try:
-            return cartella_da_percorso(store, nome_it)
-        except ValueError:
-            return cartella_da_percorso(store, nome_en)
-
-
-def cartelle_di_tipo(store, tipo: int, profondita: int = 3):
-    """Tutte le cartelle di un archivio di un dato DefaultItemType (2 = contatti, 3 = attivita, 5 = note)."""
-    out = []
-
-    def walk(fold, liv):
-        for sub in fold.Folders:
-            try:
-                if sub.DefaultItemType == tipo:
-                    out.append(sub)
-            except Exception:  # noqa: BLE001
-                pass
-            if liv < profondita:
-                walk(sub, liv + 1)
-
-    walk(store.GetRootFolder(), 1)
-    return out
-
-
-def verifica_classe(item, attesa: int, cosa: str) -> None:
-    """Rifiuta un id che indica un elemento di tipo diverso da quello atteso (per esempio un contatto passato a elimina_mail)."""
+def check_class(item, expected: int, what: str) -> None:
+    """Refuses an id that points to a different kind of item (for example a contact passed to delete_mail)."""
     try:
         c = item.Class
     except Exception:  # noqa: BLE001
         return
-    if c != attesa:
-        raise ValueError(f"L'id indicato non è {cosa} (classe {CLASSI.get(c, c)}).")
+    if c != expected:
+        raise ValueError(f"The given id is not {what} (class {CLASSES.get(c, c)}).")
 
 
-def e_cestino(store, fold) -> bool:
-    """True se la cartella è il cestino dell'archivio o sta dentro un cestino (per nome, in italiano o inglese)."""
+def is_trash(store, fold) -> bool:
+    """True when the folder is the store's trash or sits inside a trash (by name, in several languages)."""
     try:
         if fold.EntryID == store.GetDefaultFolder(3).EntryID:
             return True
     except Exception:  # noqa: BLE001
         pass
     try:
-        parti = [p.lower() for p in fold.FolderPath.split("\\") if p]
-        return any(p in NOMI_CESTINO for p in parti)
+        parts = [p.lower() for p in fold.FolderPath.split("\\") if p]
+        return any(p in TRASH_NAMES for p in parts)
     except Exception:  # noqa: BLE001
         return False
 
 
-def meta_contatto(c, alias: str, completo: bool = False) -> dict[str, Any]:
-    """Scheda di un contatto: i campi principali negli elenchi, tutti i campi (indirizzi, note...) con completo=True.
-    I campi vuoti non vengono restituiti, per tenere corte le risposte."""
-    d: dict[str, Any] = {"casella": alias}
+def folders_of_type(store, kind: int, depth: int = 3):
+    """All folders of a store with a given DefaultItemType (2 = contacts, 3 = tasks, 5 = notes)."""
+    out = []
+
+    def walk(fold, level):
+        for sub in fold.Folders:
+            try:
+                if sub.DefaultItemType == kind:
+                    out.append(sub)
+            except Exception:  # noqa: BLE001
+                pass
+            if level < depth:
+                walk(sub, level + 1)
+
+    walk(store.GetRootFolder(), 1)
+    return out
+
+
+def contact_meta(c, alias: str, full: bool = False) -> dict[str, Any]:
+    """A contact card: main fields in listings, every field (addresses, notes...) with full=True.
+    Empty fields are omitted to keep answers short."""
+    d: dict[str, Any] = {"mailbox": alias}
     try:
         d["id"] = c.EntryID
     except Exception:  # noqa: BLE001
         d["id"] = None
-    campi = [("nome_completo", "FullName"), ("azienda", "CompanyName"), ("ruolo", "JobTitle"),
-             ("email", "Email1Address"), ("email2", "Email2Address"), ("tel_lavoro", "BusinessTelephoneNumber"),
-             ("cellulare", "MobileTelephoneNumber"), ("tel_casa", "HomeTelephoneNumber"), ("categorie", "Categories")]
-    if completo:
-        campi += [("nome", "FirstName"), ("cognome", "LastName"), ("email3", "Email3Address"),
-                  ("indirizzo_lavoro", "BusinessAddress"), ("indirizzo_casa", "HomeAddress"), ("sito_web", "WebPage"),
-                  ("reparto", "Department"), ("note", "Body"), ("archiviato_come", "FileAs")]
-    for chiave, attr in campi:
+    fields = [("full_name", "FullName"), ("company", "CompanyName"), ("job_title", "JobTitle"),
+              ("email", "Email1Address"), ("email2", "Email2Address"), ("business_phone", "BusinessTelephoneNumber"),
+              ("mobile_phone", "MobileTelephoneNumber"), ("home_phone", "HomeTelephoneNumber"), ("categories", "Categories")]
+    if full:
+        fields += [("first_name", "FirstName"), ("last_name", "LastName"), ("email3", "Email3Address"),
+                   ("business_address", "BusinessAddress"), ("home_address", "HomeAddress"), ("website", "WebPage"),
+                   ("department", "Department"), ("notes", "Body"), ("file_as", "FileAs")]
+    for key, attr in fields:
         try:
             v = getattr(c, attr)
             if v not in (None, ""):
-                d[chiave] = v.strip() if isinstance(v, str) else v
+                d[key] = v.strip() if isinstance(v, str) else v
         except Exception:  # noqa: BLE001
             pass
     try:
-        d["cartella"] = c.Parent.FolderPath
+        d["folder"] = c.Parent.FolderPath
     except Exception:  # noqa: BLE001
         pass
     return d
 
 
-def meta_attivita(t, alias: str, completo: bool = False) -> dict[str, Any]:
-    """Dati di un'attività. Le date 'vuote' in Outlook valgono 1.1.4501: vengono restituite come null."""
-    d: dict[str, Any] = {"casella": alias}
+def task_meta(t, alias: str, full: bool = False) -> dict[str, Any]:
+    """Data of a task. 'Empty' dates in Outlook are 1.1.4501: they are returned as null."""
+    d: dict[str, Any] = {"mailbox": alias}
     try:
         d["id"] = t.EntryID
     except Exception:  # noqa: BLE001
         d["id"] = None
-    for chiave, attr in (("oggetto", "Subject"), ("completata", "Complete"), ("percentuale", "PercentComplete"),
-                         ("priorita", "Importance"), ("categorie", "Categories"), ("stato", "Status"),
-                         ("promemoria", "ReminderSet")):
+    for key, attr in (("subject", "Subject"), ("complete", "Complete"), ("percent_complete", "PercentComplete"),
+                      ("priority", "Importance"), ("categories", "Categories"), ("status", "Status"),
+                      ("reminder", "ReminderSet")):
         try:
-            d[chiave] = getattr(t, attr)
+            d[key] = getattr(t, attr)
         except Exception:  # noqa: BLE001
-            d[chiave] = None
-    for chiave, attr in (("scadenza", "DueDate"), ("inizio", "StartDate"), ("completata_il", "DateCompleted"),
-                         ("promemoria_il", "ReminderTime")):
+            d[key] = None
+    for key, attr in (("due_date", "DueDate"), ("start_date", "StartDate"), ("completed_on", "DateCompleted"),
+                      ("reminder_time", "ReminderTime")):
         try:
             v = getattr(t, attr)
-            d[chiave] = None if (v is None or v.year >= 4500) else fmt(v)
+            d[key] = None if (v is None or v.year >= 4500) else fmt(v)
         except Exception:  # noqa: BLE001
-            d[chiave] = None
-    if completo:
+            d[key] = None
+    if full:
         try:
-            d["descrizione"] = (t.Body or "")[:MAX_CORPO]
+            d["description"] = (t.Body or "")[:MAX_BODY]
         except Exception:  # noqa: BLE001
             pass
     try:
-        d["cartella"] = t.Parent.FolderPath
+        d["folder"] = t.Parent.FolderPath
     except Exception:  # noqa: BLE001
         pass
     return d
 
 
-def meta_nota(n, alias: str, completo: bool = False) -> dict[str, Any]:
-    """Dati di una nota (i 'post-it' di Outlook): titolo (la prima riga), categorie, data di modifica, testo se completo."""
-    d: dict[str, Any] = {"casella": alias}
+def note_meta(n, alias: str, full: bool = False) -> dict[str, Any]:
+    """Data of a note (Outlook's sticky notes): title (first line), categories, modification time, text when full."""
+    d: dict[str, Any] = {"mailbox": alias}
     try:
         d["id"] = n.EntryID
     except Exception:  # noqa: BLE001
         d["id"] = None
-    for chiave, attr in (("titolo", "Subject"), ("categorie", "Categories")):
+    for key, attr in (("title", "Subject"), ("categories", "Categories")):
         try:
-            d[chiave] = getattr(n, attr)
+            d[key] = getattr(n, attr)
         except Exception:  # noqa: BLE001
-            d[chiave] = None
+            d[key] = None
     try:
-        d["modificata"] = fmt(n.LastModificationTime)
+        d["modified"] = fmt(n.LastModificationTime)
     except Exception:  # noqa: BLE001
         pass
-    if completo:
+    if full:
         try:
-            d["testo"] = (n.Body or "")[:MAX_CORPO]
+            d["text"] = (n.Body or "")[:MAX_BODY]
         except Exception:  # noqa: BLE001
             pass
     return d
 
 
-def _applica_contatto(c, nome, cognome, azienda, ruolo, email, email2, tel_lavoro, cellulare, tel_casa,
-                      indirizzo_lavoro, sito_web, note, categorie) -> None:
-    """Scrive sul contatto solo i campi passati (None = non toccare). Condivisa fra crea_contatto e modifica_contatto."""
-    for valore, attr in ((nome, "FirstName"), (cognome, "LastName"), (azienda, "CompanyName"), (ruolo, "JobTitle"),
-                         (email, "Email1Address"), (email2, "Email2Address"), (tel_lavoro, "BusinessTelephoneNumber"),
-                         (cellulare, "MobileTelephoneNumber"), (tel_casa, "HomeTelephoneNumber"),
-                         (indirizzo_lavoro, "BusinessAddress"), (sito_web, "WebPage"), (note, "Body"),
-                         (categorie, "Categories")):
-        if valore is not None:
-            setattr(c, attr, valore)
+def _apply_contact(c, first_name, last_name, company, job_title, email, email2, business_phone, mobile_phone,
+                   home_phone, business_address, website, notes, categories) -> None:
+    """Writes only the given fields onto the contact (None = leave alone). Shared by create_contact and update_contact."""
+    for value, attr in ((first_name, "FirstName"), (last_name, "LastName"), (company, "CompanyName"), (job_title, "JobTitle"),
+                        (email, "Email1Address"), (email2, "Email2Address"), (business_phone, "BusinessTelephoneNumber"),
+                        (mobile_phone, "MobileTelephoneNumber"), (home_phone, "HomeTelephoneNumber"),
+                        (business_address, "BusinessAddress"), (website, "WebPage"), (notes, "Body"),
+                        (categories, "Categories")):
+        if value is not None:
+            setattr(c, attr, value)
 
 
-def _applica_attivita(t, oggetto, scadenza, inizio, descrizione, priorita, promemoria, categorie, completata,
-                      percentuale) -> None:
-    """Scrive sull'attività solo i campi passati (None = non toccare). promemoria='' toglie il promemoria.
-    Condivisa fra crea_attivita e modifica_attivita."""
-    if oggetto is not None:
-        t.Subject = oggetto
-    if scadenza is not None:
-        t.DueDate = com_data(parse_dt(scadenza))
-    if inizio is not None:
-        t.StartDate = com_data(parse_dt(inizio))
-    if descrizione is not None:
-        t.Body = descrizione
-    if priorita is not None:
-        p = {"bassa": 0, "normale": 1, "alta": 2}.get(str(priorita).lower())
+def _apply_task(t, subject, due_date, start_date, description, priority, reminder, categories, complete,
+                percent_complete) -> None:
+    """Writes only the given fields onto the task (None = leave alone). reminder='' removes the reminder.
+    Shared by create_task and update_task."""
+    if subject is not None:
+        t.Subject = subject
+    if due_date is not None:
+        t.DueDate = com_date(parse_dt(due_date))
+    if start_date is not None:
+        t.StartDate = com_date(parse_dt(start_date))
+    if description is not None:
+        t.Body = description
+    if priority is not None:
+        p = {"low": 0, "normal": 1, "high": 2}.get(str(priority).lower())
         if p is None:
-            raise ValueError("Priorità non valida: bassa, normale, alta.")
+            raise ValueError("Invalid priority: low, normal, high.")
         t.Importance = p
-    if promemoria is not None:
-        if promemoria == "":
+    if reminder is not None:
+        if reminder == "":
             t.ReminderSet = False
         else:
             t.ReminderSet = True
-            t.ReminderTime = com_data(parse_dt(promemoria))
-    if categorie is not None:
-        t.Categories = categorie
-    if percentuale is not None:
-        t.PercentComplete = int(percentuale)
-    if completata is not None:
-        if completata:
+            t.ReminderTime = com_date(parse_dt(reminder))
+    if categories is not None:
+        t.Categories = categories
+    if percent_complete is not None:
+        t.PercentComplete = int(percent_complete)
+    if complete is not None:
+        if complete:
             t.MarkComplete()
         else:
             t.Complete = False
             t.Status = 0
 
+
 # ----------------------------------------------------------------------------
-# Server MCP
+# MCP server
 #
-# `instructions` è il testo che Claude riceve insieme all'elenco degli strumenti: gli dice cosa c'è e quali sono le
-# regole d'uso. Gli strumenti sono le funzioni decorate con @mcp.tool; la docstring di ciascuna diventa la descrizione
-# che Claude legge per capire quando e come usarla, quindi è scritta per lui.
+# `instructions` is the text Claude receives together with the tool list: it says what is there and what the rules
+# are. The tools are the functions decorated with @mcp.tool; each docstring becomes the description Claude reads to
+# decide when and how to use it, so it is written for Claude.
 # ----------------------------------------------------------------------------
 
 mcp = MCPServer(
     "outlook",
     instructions=(
-        "Connettore locale per Outlook Classic dell'utente, sul suo PC. "
-        f"Casella predefinita: alias '{CASELLA_PREDEFINITA}' (archivio \"{CASELLE[CASELLA_PREDEFINITA]}\"); "
-        "altre caselle per alias: " + ", ".join(CASELLE) + ". "
-        "Copre posta, calendario, rubrica (contatti), attività, note e cartelle. Non invia (tranne invia_avviso, con "
-        "destinatario fisso) e non tocca regole o impostazioni. Cancella solo con elimina_mail ed elimina_evento, che "
-        "spostano nel cestino (recuperabile) e vanno usate SOLO dopo la conferma esplicita dell'utente in chat. "
-        "Le mail non lette restano non lette dopo la lettura. "
-        f"Fase attiva: {FASE} (1 lettura, 2 bozze e scritture, 3 calendario, 4 avvisi)."
+        "Local connector for the user's classic Outlook, on their PC. "
+        f"Default mailbox: alias '{DEFAULT_MAILBOX}' (store \"{MAILBOXES[DEFAULT_MAILBOX]}\"); "
+        "other mailboxes by alias: " + ", ".join(MAILBOXES) + ". "
+        "Covers mail, calendar, contacts, tasks, notes and folders. It does not send (except send_alert, with a fixed "
+        "recipient) and does not touch rules or settings. It deletes only with delete_mail and delete_event, which move "
+        "to the trash (recoverable) and must be used ONLY after the user's explicit confirmation in chat. "
+        "Unread mail stays unread after reading. "
+        f"Active phase: {PHASE} (1 read, 2 drafts and writes, 3 calendar, 4 alerts)."
     ),
 )
 
-# Annotazioni MCP: dicono al client se uno strumento è di sola lettura o distruttivo (Claude desktop le usa per
-# decidere quando chiedere conferma all'utente).
+# MCP annotations: tell the client whether a tool is read-only or destructive (Claude desktop uses them to decide
+# when to ask the user for confirmation).
 RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 RW = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
+INBOX_NAMES = {"", "inbox", "posta in arrivo", "posteingang", "boîte de réception", "bandeja de entrada"}
 
-# ---------------------------------------------------------------- fase 1: lettura della posta
+
+def mail_folder(store, folder: str):
+    """Inbox by any of its usual names, otherwise a folder by path."""
+    return inbox(store) if folder.strip().lower() in INBOX_NAMES else folder_from_path(store, folder)
+
+
+# ---------------------------------------------------------------- phase 1: reading mail
 
 @mcp.tool(annotations=RO)
-async def stato_outlook() -> dict:
-    """Verifica che Outlook Classic sia aperto e raggiungibile; riporta versione, profilo, fase attiva e caselle disponibili."""
+async def outlook_status() -> dict:
+    """Checks that classic Outlook is open and reachable; reports version, profile, active phase and available mailboxes."""
     def f():
         app = COM.outlook()
         n = app.GetNamespace("MAPI")
-        archivi = [s.DisplayName for s in n.Stores]
+        stores = [s.DisplayName for s in n.Stores]
         return {
-            "ok": True, "versione_outlook": app.Version, "profilo": n.CurrentProfileName,
-            "fase": FASE, "casella_predefinita": CASELLA_PREDEFINITA,
-            "caselle": {a: {"archivio": nome, "presente": nome in archivi} for a, nome in CASELLE.items()},
-            "archivi_in_outlook": archivi,
+            "ok": True, "outlook_version": app.Version, "profile": n.CurrentProfileName,
+            "phase": PHASE, "default_mailbox": DEFAULT_MAILBOX,
+            "mailboxes": {a: {"store": name, "present": name in stores} for a, name in MAILBOXES.items()},
+            "stores_in_outlook": stores,
         }
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def elenca_cartelle(casella: str | None = None, percorso: str = "", profondita: int = 2) -> list[dict]:
-    """Elenca le cartelle di una casella (alias o nome archivio) a partire da un percorso (vuoto = radice), con conteggi.
-    Tipi: posta, calendario, contatti, attivita, note."""
-    tipi = TIPI_CARTELLA
-
+async def list_folders(mailbox: str | None = None, path: str = "", depth: int = 2) -> list[dict]:
+    """Lists the folders of a mailbox (alias or store name) starting from a path (empty = root), with item counts.
+    Types: mail, calendar, contacts, tasks, notes."""
     def f():
-        store = store_da_alias(casella)
-        radice = cartella_da_percorso(store, percorso)
+        store = store_from_alias(mailbox)
+        root = folder_from_path(store, path)
         out: list[dict] = []
 
-        def walk(fold, prefisso: str, liv: int):
+        def walk(fold, prefix: str, level: int):
             for sub in fold.Folders:
-                respira(len(out) + 1)
-                p = f"{prefisso}/{sub.Name}" if prefisso else sub.Name
-                riga = {"percorso": p, "tipo": tipi.get(sub.DefaultItemType, str(sub.DefaultItemType))}
+                breathe(len(out) + 1)
+                p = f"{prefix}/{sub.Name}" if prefix else sub.Name
+                row = {"path": p, "type": FOLDER_TYPES.get(sub.DefaultItemType, str(sub.DefaultItemType))}
                 try:
-                    riga["elementi"] = sub.Items.Count
-                    riga["non_letti"] = sub.UnReadItemCount
+                    row["items"] = sub.Items.Count
+                    row["unread"] = sub.UnReadItemCount
                 except Exception:  # noqa: BLE001
                     pass
-                out.append(riga)
-                if liv < profondita:
-                    walk(sub, p, liv + 1)
+                out.append(row)
+                if level < depth:
+                    walk(sub, p, level + 1)
 
-        walk(radice, percorso.strip("/\\"), 1)
+        walk(root, path.strip("/\\"), 1)
         return out
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def elenca_mail(casella: str | None = None, cartella: str = "Posta in arrivo", giorni: int = 7,
-                      massimo: int = 30, solo_non_lette: bool = False) -> list[dict]:
-    """Elenca le mail più recenti di una cartella (predefinita: Posta in arrivo della casella predefinita), dalla più nuova.
-    Restituisce solo i metadati (id, data, mittente, oggetto, non letta, numero allegati), mai il corpo."""
+async def list_mail(mailbox: str | None = None, folder: str = "Inbox", days: int = 7,
+                    limit: int = 30, unread_only: bool = False) -> list[dict]:
+    """Lists the most recent mail of a folder (default: Inbox of the default mailbox), newest first.
+    Returns metadata only (id, date, sender, subject, unread flag, attachment count), never the body."""
     def f():
-        store = store_da_alias(casella)
-        fold = posta_in_arrivo(store) if cartella.lower() in ("posta in arrivo", "inbox", "") else cartella_da_percorso(store, cartella)
-        da = dt.datetime.now() - dt.timedelta(days=max(1, giorni))
-        filtro = f"@SQL=\"urn:schemas:httpmail:datereceived\" >= '{dasl_data(da)}'"
-        if solo_non_lette:
-            filtro += " AND \"urn:schemas:httpmail:read\" = 0"
-        items = fold.Items.Restrict(filtro)
+        store = store_from_alias(mailbox)
+        fold = mail_folder(store, folder)
+        since = dt.datetime.now() - dt.timedelta(days=max(1, days))
+        flt = f"@SQL=\"urn:schemas:httpmail:datereceived\" >= '{dasl_date(since)}'"
+        if unread_only:
+            flt += " AND \"urn:schemas:httpmail:read\" = 0"
+        items = fold.Items.Restrict(flt)
         items.Sort("[ReceivedTime]", True)
-        return [meta_mail(it, casella or CASELLA_PREDEFINITA) for it in itera(items, max(1, min(massimo, 200)))]
+        return [mail_meta(it, mailbox or DEFAULT_MAILBOX) for it in iterate(items, max(1, min(limit, 200)))]
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def cerca_mail(testo: str, casella: str | None = None, cartella: str = "Posta in arrivo",
-                     in_oggetto: bool = True, in_corpo: bool = False, mittente: str | None = None,
-                     da_data: str | None = None, a_data: str | None = None, massimo: int = 30) -> list[dict]:
-    """Cerca mail in una cartella per testo nell'oggetto e/o nel corpo, mittente (nome o indirizzo) e intervallo di date (AAAA-MM-GG).
-    La ricerca nel corpo (in_corpo=true) è lenta e blocca Outlook: richiede da_data (intervallo di date). Restituisce solo metadati."""
+async def search_mail(text: str, mailbox: str | None = None, folder: str = "Inbox",
+                      in_subject: bool = True, in_body: bool = False, sender: str | None = None,
+                      from_date: str | None = None, to_date: str | None = None, limit: int = 30) -> list[dict]:
+    """Searches mail in a folder by text in the subject and/or body, sender (name or address) and date range (YYYY-MM-DD).
+    Body search (in_body=true) is slow and freezes Outlook: it requires from_date. Returns metadata only."""
     def f():
-        store = store_da_alias(casella)
-        fold = posta_in_arrivo(store) if cartella.lower() in ("posta in arrivo", "inbox", "") else cartella_da_percorso(store, cartella)
+        store = store_from_alias(mailbox)
+        fold = mail_folder(store, folder)
         cond: list[str] = []
-        t = dasl_lit(testo)
-        parti = []
-        if in_oggetto:
-            parti.append(f"\"urn:schemas:httpmail:subject\" LIKE '%{t}%'")
-        if in_corpo:
-            parti.append(f"\"urn:schemas:httpmail:textdescription\" LIKE '%{t}%'")
-        if parti:
-            cond.append("(" + " OR ".join(parti) + ")")
-        if mittente:
-            m = dasl_lit(mittente)
+        t = dasl_lit(text)
+        parts = []
+        if in_subject:
+            parts.append(f"\"urn:schemas:httpmail:subject\" LIKE '%{t}%'")
+        if in_body:
+            parts.append(f"\"urn:schemas:httpmail:textdescription\" LIKE '%{t}%'")
+        if parts:
+            cond.append("(" + " OR ".join(parts) + ")")
+        if sender:
+            m = dasl_lit(sender)
             cond.append(f"(\"urn:schemas:httpmail:fromname\" LIKE '%{m}%' OR \"urn:schemas:httpmail:fromemail\" LIKE '%{m}%')")
-        d1, d2 = parse_dt(da_data), parse_dt(a_data, fine_giornata=True)
+        d1, d2 = parse_dt(from_date), parse_dt(to_date, end_of_day=True)
         if d1:
-            cond.append(f"\"urn:schemas:httpmail:datereceived\" >= '{dasl_data(d1)}'")
+            cond.append(f"\"urn:schemas:httpmail:datereceived\" >= '{dasl_date(d1)}'")
         if d2:
-            cond.append(f"\"urn:schemas:httpmail:datereceived\" <= '{dasl_data(d2)}'")
+            cond.append(f"\"urn:schemas:httpmail:datereceived\" <= '{dasl_date(d2)}'")
         if not cond:
-            raise ValueError("Nessun criterio di ricerca.")
-        if in_corpo and not d1:
-            raise ValueError("La ricerca nel corpo richiede da_data (e meglio anche a_data): su cartelle grandi bloccherebbe Outlook per secondi.")
+            raise ValueError("No search criteria.")
+        if in_body and not d1:
+            raise ValueError("Body search requires from_date (and preferably to_date): on large folders it would freeze Outlook for seconds.")
         items = fold.Items.Restrict("@SQL=" + " AND ".join(cond))
         items.Sort("[ReceivedTime]", True)
-        return [meta_mail(it, casella or CASELLA_PREDEFINITA) for it in itera(items, max(1, min(massimo, 200)))]
+        return [mail_meta(it, mailbox or DEFAULT_MAILBOX) for it in iterate(items, max(1, min(limit, 200)))]
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def leggi_mail(id: str, casella: str | None = None, formato: str = "testo", max_caratteri: int | None = None,
-                     intestazioni: bool = False) -> dict:
-    """Legge una mail (id da elenca_mail/cerca_mail): intestazioni, corpo (formato 'testo' o 'html') ed elenco allegati.
-    Con intestazioni=true aggiunge 'intestazioni_trasporto': le intestazioni Internet complete (Received,
-    Authentication-Results, DKIM-Signature, Return-Path...) per controllare SPF, DKIM e DMARC.
-    Se la mail era non letta, resta non letta."""
+async def read_mail(id: str, mailbox: str | None = None, format: str = "text", max_chars: int | None = None,
+                    headers: bool = False) -> dict:
+    """Reads a mail (id from list_mail/search_mail): metadata, body (format 'text' or 'html') and attachment list.
+    With headers=true adds 'transport_headers': the full Internet headers (Received, Authentication-Results,
+    DKIM-Signature, Return-Path...) to check SPF, DKIM and DMARC. If the mail was unread, it stays unread."""
     def f():
-        item, _ = elemento(id, casella)
-        era_non_letta = bool(item.UnRead)
-        d = meta_mail(item, casella or CASELLA_PREDEFINITA)
-        lim = max_caratteri or MAX_CORPO
-        corpo = item.HTMLBody if formato == "html" else item.Body
-        corpo = corpo or ""
-        d["corpo"] = corpo[:lim]
-        d["corpo_troncato"] = len(corpo) > lim
-        alle = []
+        item, _ = item_by_id(id, mailbox)
+        was_unread = bool(item.UnRead)
+        d = mail_meta(item, mailbox or DEFAULT_MAILBOX)
+        lim = max_chars or MAX_BODY
+        body = item.HTMLBody if format == "html" else item.Body
+        body = body or ""
+        d["body"] = body[:lim]
+        d["body_truncated"] = len(body) > lim
+        atts = []
         for i in range(1, item.Attachments.Count + 1):
             a = item.Attachments.Item(i)
-            alle.append({"indice": i, "nome": a.FileName, "dimensione": a.Size})
-        d["elenco_allegati"] = alle
-        if intestazioni:
+            atts.append({"index": i, "name": a.FileName, "size": a.Size})
+        d["attachment_list"] = atts
+        if headers:
             try:
-                d["intestazioni_trasporto"] = item.PropertyAccessor.GetProperty(PROP_INTESTAZIONI) or ""
+                d["transport_headers"] = item.PropertyAccessor.GetProperty(PROP_HEADERS) or ""
             except Exception:  # noqa: BLE001
-                d["intestazioni_trasporto"] = ""
-            if not d["intestazioni_trasporto"]:
-                d["intestazioni_nota"] = ("Intestazioni di trasporto non disponibili per questo elemento (bozze, elementi "
-                                          "creati in Outlook o non conservate dall'archivio). Per la prova forense serve "
-                                          "l'.eml originale dal server.")
-        if era_non_letta and not item.UnRead:
+                d["transport_headers"] = ""
+            if not d["transport_headers"]:
+                d["headers_note"] = ("Transport headers not available for this item (drafts, items created in Outlook, "
+                                     "or not kept by the store). For forensic proof the original .eml from the server is needed.")
+        if was_unread and not item.UnRead:
             item.UnRead = True
             item.Save()
-        d["non_letta"] = bool(item.UnRead)
+        d["unread"] = bool(item.UnRead)
         return d
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def salva_allegati(id: str, cartella_destinazione: str, casella: str | None = None,
-                         indici: list[int] | None = None) -> list[dict]:
-    """Salva su disco gli allegati di una mail (tutti, o quelli con gli indici dati da leggi_mail) in una cartella
-    consentita (una di quelle in "cartelle_salvataggio" di config.json, o una sua sottocartella). Non sovrascrive mai
-    file esistenti; accanto a ogni file scrive l'impronta SHA-256. Se la mail era non letta, resta non letta."""
+async def save_attachments(id: str, destination_folder: str, mailbox: str | None = None,
+                           indexes: list[int] | None = None) -> list[dict]:
+    """Saves the attachments of a mail to disk (all of them, or those with the given indexes from read_mail) into an
+    allowed folder (one of "save_folders" in config.json, or a subfolder). Never overwrites existing files; writes a
+    SHA-256 fingerprint next to each file. If the mail was unread, it stays unread."""
     def f():
-        dest = Path(cartella_destinazione)
-        if not percorso_consentito(dest):
-            raise ValueError("Cartella non consentita. Consentite: " + "; ".join(str(p) for p in CARTELLE_SALVATAGGIO))
+        dest = Path(destination_folder)
+        if not path_allowed(dest):
+            raise ValueError("Folder not allowed. Allowed: " + "; ".join(str(p) for p in SAVE_FOLDERS))
         dest.mkdir(parents=True, exist_ok=True)
-        item, _ = elemento(id, casella)
-        era_non_letta = bool(item.UnRead)
+        item, _ = item_by_id(id, mailbox)
+        was_unread = bool(item.UnRead)
         out = []
         for i in range(1, item.Attachments.Count + 1):
-            if indici and i not in indici:
+            if indexes and i not in indexes:
                 continue
             a = item.Attachments.Item(i)
-            target = nome_libero(dest, a.FileName)
+            target = free_name(dest, a.FileName)
             a.SaveAsFile(str(target))
-            imp = impronta_sha256(target, origine="allegato di una mail", casella=casella or CASELLA_PREDEFINITA,
-                                  oggetto_mail=item.Subject or "", allegato=a.FileName, id_mail=id)
-            out.append({"indice": i, "nome": a.FileName, "salvato_in": str(target), "dimensione": target.stat().st_size,
-                        **imp})
-        if era_non_letta and not item.UnRead:
+            fp = sha256_fingerprint(target, origin="mail attachment", mailbox=mailbox or DEFAULT_MAILBOX,
+                                    mail_subject=item.Subject or "", attachment=a.FileName, mail_id=id)
+            out.append({"index": i, "name": a.FileName, "saved_to": str(target), "size": target.stat().st_size, **fp})
+        if was_unread and not item.UnRead:
             item.UnRead = True
             item.Save()
-        audit("salva_allegati", casella=casella or CASELLA_PREDEFINITA, id=id, file=[o["salvato_in"] for o in out],
+        audit("save_attachments", mailbox=mailbox or DEFAULT_MAILBOX, id=id, files=[o["saved_to"] for o in out],
               sha256=[o["sha256"] for o in out])
         return out
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def salva_mail(id: str, cartella_destinazione: str, casella: str | None = None) -> dict:
-    """Salva la mail completa come file .msg (Unicode): intestazioni di trasporto, testo, HTML e allegati.
-    Solo in una cartella consentita ("cartelle_salvataggio" di config.json, o una sottocartella), mai sovrascrivendo.
-    Nome: AAAA-MM-GG_HHMM_<oggetto>.msg con la data di ricezione. Accanto scrive <file>.sha256 con impronta, data e
-    ora di acquisizione. Se la mail era non letta, resta non letta.
-    Nota: per la prova forense il .msg NON sostituisce l'.eml originale (la firma DKIM non si può riverificare)."""
+async def save_mail(id: str, destination_folder: str, mailbox: str | None = None) -> dict:
+    """Saves the whole mail as a .msg file (Unicode): transport headers, text, HTML and attachments.
+    Only into an allowed folder ("save_folders" in config.json, or a subfolder), never overwriting.
+    Name: YYYY-MM-DD_HHMM_<subject>.msg with the received date. Writes <file>.sha256 next to it with the fingerprint
+    and the acquisition date/time. If the mail was unread, it stays unread.
+    Note: for forensic proof the .msg does NOT replace the original .eml (the DKIM signature cannot be re-verified)."""
     def f():
-        dest = Path(cartella_destinazione)
-        if not percorso_consentito(dest):
-            raise ValueError("Cartella non consentita. Consentite: " + "; ".join(str(p) for p in CARTELLE_SALVATAGGIO))
+        dest = Path(destination_folder)
+        if not path_allowed(dest):
+            raise ValueError("Folder not allowed. Allowed: " + "; ".join(str(p) for p in SAVE_FOLDERS))
         dest.mkdir(parents=True, exist_ok=True)
-        item, _ = elemento(id, casella)
+        item, _ = item_by_id(id, mailbox)
         if int(getattr(item, "Class", 0)) != 43:
-            raise ValueError("L'elemento non è una mail (salva_mail salva solo messaggi di posta).")
-        era_non_letta = bool(item.UnRead)
-        oggetto = item.Subject or ""
-        target = nome_libero(dest, f"{data_per_nome(item)}_{nome_da_oggetto(oggetto)}.msg")
+            raise ValueError("The item is not a mail (save_mail saves mail messages only).")
+        was_unread = bool(item.UnRead)
+        subject = item.Subject or ""
+        target = free_name(dest, f"{date_for_name(item)}_{name_from_subject(subject)}.msg")
         try:
             item.SaveAs(str(target), OL_MSG_UNICODE)
         finally:
-            if era_non_letta and not item.UnRead:
+            if was_unread and not item.UnRead:
                 item.UnRead = True
                 item.Save()
         if not target.is_file():
-            raise ValueError(f"Outlook non ha scritto il file {target}.")
-        imp = impronta_sha256(target, origine="mail completa (.msg Unicode, MailItem.SaveAs)",
-                              casella=casella or CASELLA_PREDEFINITA, oggetto_mail=oggetto, id_mail=id,
-                              nota="il .msg non sostituisce l'.eml originale per la verifica DKIM")
-        audit("salva_mail", casella=casella or CASELLA_PREDEFINITA, id=id, file=str(target), sha256=imp["sha256"])
-        return {"id": id, "oggetto": oggetto, "salvato_in": str(target), "dimensione": target.stat().st_size,
-                "non_letta": bool(item.UnRead), **imp}
+            raise ValueError(f"Outlook did not write the file {target}.")
+        fp = sha256_fingerprint(target, origin="whole mail (.msg Unicode, MailItem.SaveAs)",
+                                mailbox=mailbox or DEFAULT_MAILBOX, mail_subject=subject, mail_id=id,
+                                note="the .msg does not replace the original .eml for DKIM verification")
+        audit("save_mail", mailbox=mailbox or DEFAULT_MAILBOX, id=id, file=str(target), sha256=fp["sha256"])
+        return {"id": id, "subject": subject, "saved_to": str(target), "size": target.stat().st_size,
+                "unread": bool(item.UnRead), **fp}
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def segna_mail(id: str, letta: bool, casella: str | None = None) -> dict:
-    """Segna una mail come letta (letta=true) o non letta (letta=false)."""
+async def mark_mail(id: str, read: bool, mailbox: str | None = None) -> dict:
+    """Marks a mail as read (read=true) or unread (read=false)."""
     def f():
-        item, _ = elemento(id, casella)
-        item.UnRead = not letta
+        item, _ = item_by_id(id, mailbox)
+        item.UnRead = not read
         item.Save()
-        audit("segna_mail", casella=casella or CASELLA_PREDEFINITA, id=id, letta=letta)
-        return {"id": id, "non_letta": bool(item.UnRead)}
+        audit("mark_mail", mailbox=mailbox or DEFAULT_MAILBOX, id=id, read=read)
+        return {"id": id, "unread": bool(item.UnRead)}
     return await com(f)
 
 
-# ---------------------------------------------------------------- fase 2: bozze
+# ---------------------------------------------------------------- phase 2: drafts
 
 @mcp.tool(annotations=RW)
-async def crea_bozza(oggetto: str, corpo: str, a: str = "", cc: str = "", casella: str | None = None,
-                     formato: str = "testo", allegati: list[str] | None = None) -> dict:
-    """Crea una bozza di mail nella cartella Bozze della casella (predefinita: la casella predefinita di config.json).
-    Non invia mai: la bozza resta in Outlook perché l'utente la riveda, la firmi se vuole e la spedisca lui.
-    Destinatari separati da ';'. formato: 'testo' oppure 'html' (corpo già in HTML). 'allegati' = percorsi di file sul PC."""
-    richiede_fase(2)
+async def create_draft(subject: str, body: str, to: str = "", cc: str = "", mailbox: str | None = None,
+                       format: str = "text", attachments: list[str] | None = None) -> dict:
+    """Creates a mail draft in the Drafts folder of the mailbox (default: the default mailbox of config.json).
+    Never sends: the draft stays in Outlook for the user to review, sign if they wish, and send themselves.
+    Recipients separated by ';'. format: 'text' or 'html' (body already in HTML). 'attachments' = file paths on the PC."""
+    require_phase(2)
 
     def f():
-        store = store_da_alias(casella)
-        fold = bozze(store)
-        m = fold.Items.Add(0)  # olMailItem, creato direttamente nella cartella Bozze della casella giusta
-        acc = account_per_store(store)
+        store = store_from_alias(mailbox)
+        fold = drafts(store)
+        m = fold.Items.Add(0)  # olMailItem, created directly in the Drafts folder of the right mailbox
+        acc = account_for_store(store)
         if acc is not None:
-            m.SendUsingAccount = acc  # così la bozza ha già il mittente di quella casella
-        m.Subject = oggetto
-        m.To = a
+            m.SendUsingAccount = acc  # so the draft already carries that mailbox's sender
+        m.Subject = subject
+        m.To = to
         m.CC = cc
-        # Anche il formato 'testo' passa dalla via HTML con pagina di codice UTF-8: scrivendo m.Body la bozza resta
-        # nella pagina di codice predefinita del profilo e le lettere accentate possono arrivare corrotte.
-        forza_utf8(m)
-        if formato == "html":
-            m.HTMLBody = _RE_META_CHARSET.sub("", corpo)
+        # Even the 'text' format goes through HTML with the UTF-8 code page: writing m.Body leaves the draft in the
+        # profile's default code page and accented letters may arrive corrupted.
+        force_utf8(m)
+        if format == "html":
+            m.HTMLBody = _RE_META_CHARSET.sub("", body)
         else:
-            m.HTMLBody = testo_a_html(corpo)
-        for p in allegati or []:
+            m.HTMLBody = text_to_html(body)
+        for p in attachments or []:
             pp = Path(p)
             if not pp.is_file():
-                raise ValueError(f"Allegato non trovato: {p}")
+                raise ValueError(f"Attachment not found: {p}")
             m.Attachments.Add(str(pp))
         m.Save()
-        audit("crea_bozza", casella=casella or CASELLA_PREDEFINITA, id=m.EntryID, oggetto=oggetto)
-        return {"id": m.EntryID, "cartella": fold.FolderPath, "oggetto": oggetto, "a": a, "cc": cc, "inviata": False}
+        audit("create_draft", mailbox=mailbox or DEFAULT_MAILBOX, id=m.EntryID, subject=subject)
+        return {"id": m.EntryID, "folder": fold.FolderPath, "subject": subject, "to": to, "cc": cc, "sent": False}
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def crea_bozza_risposta(id: str, corpo: str, casella: str | None = None, a_tutti: bool = False) -> dict:
-    """Crea una bozza di risposta a una mail (id da elenca_mail/cerca_mail), con il testo dato sopra la citazione
-    dell'originale. Non invia mai. Se la mail originale era non letta, resta non letta."""
-    richiede_fase(2)
+async def create_reply_draft(id: str, body: str, mailbox: str | None = None, reply_all: bool = False) -> dict:
+    """Creates a reply draft to a mail (id from list_mail/search_mail), with the given text above the quoted original.
+    Never sends. If the original mail was unread, it stays unread."""
+    require_phase(2)
 
     def f():
-        item, store = elemento(id, casella)
-        era_non_letta = bool(item.UnRead)
-        r = item.ReplyAll() if a_tutti else item.Reply()
-        # Ordine obbligatorio: PRIMA si legge l'HTML della risposta con la pagina di codice originale (altrimenti i
-        # caratteri in Windows-1252 riletti come UTF-8 diventano "\ufffd"), POI si forza UTF-8, POI si scrive il nuovo HTML.
+        item, store = item_by_id(id, mailbox)
+        was_unread = bool(item.UnRead)
+        r = item.ReplyAll() if reply_all else item.Reply()
+        # Mandatory order: FIRST read the reply's HTML with the original code page (otherwise Windows-1252 characters
+        # re-read as UTF-8 become "�"), THEN force UTF-8, THEN write the new HTML.
         html_orig = r.HTMLBody or ""
-        forza_utf8(r)
-        r.HTMLBody = html_con_testo_in_testa(html_orig, testo_a_html(corpo))
+        force_utf8(r)
+        r.HTMLBody = html_with_text_on_top(html_orig, text_to_html(body))
         r.Save()
-        # Reply() salva nelle Bozze dell'archivio predefinito del profilo: se la mail era in un'altra casella, la bozza
-        # viene spostata nelle Bozze di quella casella, dove l'utente se la aspetta.
+        # Reply() saves into the Drafts of the profile's default store: if the mail lived in another mailbox, the draft
+        # is moved to that mailbox's Drafts, where the user expects it.
         try:
-            dest = bozze(store)
+            dest = drafts(store)
             if r.Parent.StoreID != store.StoreID:
                 r = r.Move(dest)
         except Exception:  # noqa: BLE001
             pass
-        if era_non_letta and not item.UnRead:
+        if was_unread and not item.UnRead:
             item.UnRead = True
             item.Save()
-        audit("crea_bozza_risposta", casella=casella or CASELLA_PREDEFINITA, id_originale=id, id=r.EntryID)
-        return {"id": r.EntryID, "cartella": r.Parent.FolderPath, "oggetto": r.Subject, "a": r.To, "cc": r.CC, "inviata": False}
+        audit("create_reply_draft", mailbox=mailbox or DEFAULT_MAILBOX, original_id=id, id=r.EntryID)
+        return {"id": r.EntryID, "folder": r.Parent.FolderPath, "subject": r.Subject, "to": r.To, "cc": r.CC, "sent": False}
     return await com(f)
 
 
-# ---------------------------------------------------------------- fase 3: calendario
+# ---------------------------------------------------------------- phase 3: calendar
 
 @mcp.tool(annotations=RO)
-async def elenca_eventi(da_data: str | None = None, a_data: str | None = None, casella: str | None = None,
-                        calendario_nome: str | None = None, massimo: int = 100) -> list[dict]:
-    """Elenca gli eventi e i memo di un calendario fra due date (AAAA-MM-GG; predefinito: da oggi a +7 giorni),
-    con le ricorrenze espanse (ogni occorrenza di una serie compare come riga, con lo stesso id della serie).
-    'calendario_nome' vuoto = Calendario principale; altrimenti il percorso di un altro calendario (vedi elenca_cartelle)."""
+async def list_events(from_date: str | None = None, to_date: str | None = None, mailbox: str | None = None,
+                      calendar_name: str | None = None, limit: int = 100) -> list[dict]:
+    """Lists the events and memos of a calendar between two dates (YYYY-MM-DD; default: today to +7 days), with
+    recurrences expanded (every occurrence of a series is a row, carrying the id of the series).
+    'calendar_name' empty = main Calendar; otherwise the path of another calendar (see list_folders)."""
     def f():
-        store = store_da_alias(casella)
-        cal = calendario(store, calendario_nome)
-        d1 = parse_dt(da_data) or dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        d2 = parse_dt(a_data, fine_giornata=True) or (d1 + dt.timedelta(days=7))
-        # Sequenza richiesta da Outlook per espandere le serie: Sort su [Start], IncludeRecurrences = True, poi Restrict
-        # con un filtro DASL sulle date (ISO, UTC). In un altro ordine le ricorrenze non vengono espanse o il filtro
-        # viene ignorato. Si itera con l'enumeratore, mai con Count/indice (con le ricorrenze Count non è definito).
+        store = store_from_alias(mailbox)
+        cal = calendar(store, calendar_name)
+        d1 = parse_dt(from_date) or dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        d2 = parse_dt(to_date, end_of_day=True) or (d1 + dt.timedelta(days=7))
+        # Sequence Outlook requires to expand series: Sort on [Start], IncludeRecurrences = True, then Restrict with a
+        # DASL date filter (ISO, UTC). In any other order recurrences are not expanded or the filter is ignored.
+        # Iterate with the enumerator, never with Count/index (Count is undefined with recurrences).
         items = cal.Items
         items.IncludeRecurrences = True
         items.Sort("[Start]")
-        r = items.Restrict(f"@SQL=\"urn:schemas:calendar:dtstart\" >= '{dasl_data(d1)}' AND \"urn:schemas:calendar:dtstart\" <= '{dasl_data(d2)}'")
+        r = items.Restrict(f"@SQL=\"urn:schemas:calendar:dtstart\" >= '{dasl_date(d1)}' AND \"urn:schemas:calendar:dtstart\" <= '{dasl_date(d2)}'")
         out = []
-        lim = max(1, min(massimo, 500))
-        aggiorna_pause()
+        lim = max(1, min(limit, 500))
+        refresh_pauses()
         for e in r:
-            m = meta_evento(e, casella or CASELLA_PREDEFINITA, cal.FolderPath)
+            m = event_meta(e, mailbox or DEFAULT_MAILBOX, cal.FolderPath)
             out.append(m)
-            respira(len(out))
+            breathe(len(out))
             if len(out) >= lim:
                 break
-            # guardia: con le ricorrenze espanse l'enumerazione non deve mai superare la data finale
+            # guard: with recurrences expanded the enumeration must never run past the end date
             try:
                 if dt.datetime(e.Start.year, e.Start.month, e.Start.day, e.Start.hour, e.Start.minute) > d2:
                     break
@@ -1200,272 +1180,271 @@ async def elenca_eventi(da_data: str | None = None, a_data: str | None = None, c
     return await com(f)
 
 
+# Outlook OlRecurrenceType codes and OlDaysOfWeek mask.
+RECURRENCE_TYPES = {"daily": 0, "weekly": 1, "monthly": 2, "yearly": 5}
+WEEKDAYS = {"sun": 1, "mon": 2, "tue": 4, "wed": 8, "thu": 16, "fri": 32, "sat": 64}
+RECURRENCE_NAMES = {0: "daily", 1: "weekly", 2: "monthly", 3: "monthly (nth weekday)", 5: "yearly", 6: "yearly (nth weekday)"}
+
+
 @mcp.tool(annotations=RO)
-async def leggi_evento(id: str, casella: str | None = None) -> dict:
-    """Legge un evento o memo del calendario (id da elenca_eventi), con descrizione completa."""
+async def read_event(id: str, mailbox: str | None = None) -> dict:
+    """Reads an event or memo of the calendar (id from list_events), with its full description."""
     def f():
-        e, _ = elemento(id, casella)
-        d = meta_evento(e, casella or CASELLA_PREDEFINITA)
-        d["descrizione"] = (e.Body or "")[:MAX_CORPO]
+        e, _ = item_by_id(id, mailbox)
+        d = event_meta(e, mailbox or DEFAULT_MAILBOX)
+        d["description"] = (e.Body or "")[:MAX_BODY]
         try:
-            d["promemoria_minuti_prima"] = e.ReminderMinutesBeforeStart
-            d["partecipanti"] = e.RequiredAttendees
+            d["reminder_minutes_before"] = e.ReminderMinutesBeforeStart
+            d["attendees"] = e.RequiredAttendees
             if e.IsRecurring:
                 rp = e.GetRecurrencePattern()
-                d["ricorrenza"] = {"tipo": NOMI_RICORRENZA.get(rp.RecurrenceType, rp.RecurrenceType), "intervallo": rp.Interval,
-                                   "inizio": fmt(rp.PatternStartDate), "fine": None if rp.NoEndDate else fmt(rp.PatternEndDate)}
+                d["recurrence"] = {"type": RECURRENCE_NAMES.get(rp.RecurrenceType, rp.RecurrenceType), "interval": rp.Interval,
+                                   "start": fmt(rp.PatternStartDate), "end": None if rp.NoEndDate else fmt(rp.PatternEndDate)}
         except Exception:  # noqa: BLE001
             pass
         return d
     return await com(f)
 
 
-def _applica_evento(e, oggetto, inizio, fine, durata_minuti, descrizione, luogo, tutto_il_giorno,
-                    etichetta, categorie, promemoria_minuti) -> None:
-    """Scrive sull'appuntamento solo i campi passati (None = non toccare). Condivisa fra crea_evento e modifica_evento.
-    promemoria_minuti negativo = nessun promemoria. L'etichetta colorata va nella proprietà MAPI PROP_LABEL."""
-    if oggetto is not None:
-        e.Subject = oggetto
-    if inizio is not None:
-        e.Start = com_data(parse_dt(inizio))
-    if fine is not None:
-        e.End = com_data(parse_dt(fine))
-    elif durata_minuti is not None:
-        e.Duration = int(durata_minuti)
-    if descrizione is not None:
-        e.Body = descrizione
-    if luogo is not None:
-        e.Location = luogo
-    if tutto_il_giorno is not None:
-        e.AllDayEvent = bool(tutto_il_giorno)
-    if categorie is not None:
-        e.Categories = categorie
-    if promemoria_minuti is not None:
-        if int(promemoria_minuti) < 0:
+def _apply_event(e, subject, start, end, duration_minutes, description, location, all_day,
+                 label, categories, reminder_minutes) -> None:
+    """Writes only the given fields onto the appointment (None = leave alone). Shared by create_event and update_event.
+    Negative reminder_minutes = no reminder. The coloured label goes into the MAPI property PROP_LABEL."""
+    if subject is not None:
+        e.Subject = subject
+    if start is not None:
+        e.Start = com_date(parse_dt(start))
+    if end is not None:
+        e.End = com_date(parse_dt(end))
+    elif duration_minutes is not None:
+        e.Duration = int(duration_minutes)
+    if description is not None:
+        e.Body = description
+    if location is not None:
+        e.Location = location
+    if all_day is not None:
+        e.AllDayEvent = bool(all_day)
+    if categories is not None:
+        e.Categories = categories
+    if reminder_minutes is not None:
+        if int(reminder_minutes) < 0:
             e.ReminderSet = False
         else:
             e.ReminderSet = True
-            e.ReminderMinutesBeforeStart = int(promemoria_minuti)
-    if etichetta is not None:
-        k = etichetta.strip().lower()
-        if k not in ETICHETTE:
-            raise ValueError("Etichetta non valida. Valide: " + ", ".join(ETICHETTE))
-        e.PropertyAccessor.SetProperty(PROP_LABEL, ETICHETTE[k])
+            e.ReminderMinutesBeforeStart = int(reminder_minutes)
+    if label is not None:
+        k = label.strip().lower()
+        if k not in LABELS:
+            raise ValueError("Invalid label. Valid: " + ", ".join(LABELS))
+        e.PropertyAccessor.SetProperty(PROP_LABEL, LABELS[k])
 
 
-# Codici OlRecurrenceType e maschera OlDaysOfWeek di Outlook.
-TIPI_RICORRENZA = {"giornaliera": 0, "settimanale": 1, "mensile": 2, "annuale": 5}
-GIORNI_SETTIMANA = {"dom": 1, "lun": 2, "mar": 4, "mer": 8, "gio": 16, "ven": 32, "sab": 64}
-NOMI_RICORRENZA = {0: "giornaliera", 1: "settimanale", 2: "mensile", 3: "mensile (n-esimo giorno)", 5: "annuale", 6: "annuale (n-esimo giorno)"}
-
-
-def _applica_ricorrenza(e, ricorrenza: str, intervallo: int | None, giorni_settimana: str | None,
-                        fine_ricorrenza: str | None, occorrenze: int | None) -> dict:
-    """Trasforma l'appuntamento in una serie. Va chiamata dopo aver impostato Start, End e Duration, perché il modello
-    di ricorrenza (RecurrencePattern) prende da lì orario e durata. Ordine delle proprietà verificato sul campo:
-    RecurrenceType, poi DayOfWeekMask o DayOfMonth/MonthOfYear, Interval, PatternStartDate, StartTime, EndTime, Duration,
-    e per ultimo la fine (PatternEndDate, Occurrences oppure NoEndDate)."""
-    k = (ricorrenza or "").strip().lower()
-    if k not in TIPI_RICORRENZA:
-        raise ValueError("Ricorrenza non valida: giornaliera, settimanale, mensile, annuale.")
-    inizio = dt.datetime(e.Start.year, e.Start.month, e.Start.day, e.Start.hour, e.Start.minute)
-    fine = dt.datetime(e.End.year, e.End.month, e.End.day, e.End.hour, e.End.minute)
+def _apply_recurrence(e, recurrence: str, interval: int | None, weekdays: str | None,
+                      recurrence_end: str | None, occurrences: int | None) -> dict:
+    """Turns the appointment into a series. Must be called after Start, End and Duration are set, because the
+    RecurrencePattern takes time and duration from them. Property order verified in the field: RecurrenceType, then
+    DayOfWeekMask or DayOfMonth/MonthOfYear, Interval, PatternStartDate, StartTime, EndTime, Duration, and the end
+    last (PatternEndDate, Occurrences or NoEndDate)."""
+    k = (recurrence or "").strip().lower()
+    if k not in RECURRENCE_TYPES:
+        raise ValueError("Invalid recurrence: daily, weekly, monthly, yearly.")
+    start = dt.datetime(e.Start.year, e.Start.month, e.Start.day, e.Start.hour, e.Start.minute)
+    end = dt.datetime(e.End.year, e.End.month, e.End.day, e.End.hour, e.End.minute)
     rp = e.GetRecurrencePattern()
-    rp.RecurrenceType = TIPI_RICORRENZA[k]
-    if k == "settimanale":
+    rp.RecurrenceType = RECURRENCE_TYPES[k]
+    if k == "weekly":
         mask = 0
-        for g in [x.strip().lower()[:3] for x in (giorni_settimana or "").replace(";", ",").split(",") if x.strip()]:
-            if g not in GIORNI_SETTIMANA:
-                raise ValueError("Giorni della settimana non validi: usare lun, mar, mer, gio, ven, sab, dom separati da virgola.")
-            mask |= GIORNI_SETTIMANA[g]
+        for g in [x.strip().lower()[:3] for x in (weekdays or "").replace(";", ",").split(",") if x.strip()]:
+            if g not in WEEKDAYS:
+                raise ValueError("Invalid weekdays: use mon, tue, wed, thu, fri, sat, sun separated by commas.")
+            mask |= WEEKDAYS[g]
         if mask == 0:
-            mask = [2, 4, 8, 16, 32, 64, 1][inizio.weekday()]  # il giorno di inizio
+            mask = [2, 4, 8, 16, 32, 64, 1][start.weekday()]  # the start day
         rp.DayOfWeekMask = mask
-    elif k == "mensile":
-        rp.DayOfMonth = inizio.day
-    elif k == "annuale":
-        rp.MonthOfYear = inizio.month
-        rp.DayOfMonth = inizio.day
-    rp.Interval = max(1, int(intervallo or 1))
-    rp.PatternStartDate = com_data(inizio.replace(hour=0, minute=0, second=0))
-    rp.StartTime = com_data(inizio)
-    rp.EndTime = com_data(fine)
-    rp.Duration = int((fine - inizio).total_seconds() // 60)
-    if fine_ricorrenza:
-        rp.PatternEndDate = com_data(parse_dt(fine_ricorrenza).replace(hour=0, minute=0, second=0))
-    elif occorrenze:
-        rp.Occurrences = int(occorrenze)
+    elif k == "monthly":
+        rp.DayOfMonth = start.day
+    elif k == "yearly":
+        rp.MonthOfYear = start.month
+        rp.DayOfMonth = start.day
+    rp.Interval = max(1, int(interval or 1))
+    rp.PatternStartDate = com_date(start.replace(hour=0, minute=0, second=0))
+    rp.StartTime = com_date(start)
+    rp.EndTime = com_date(end)
+    rp.Duration = int((end - start).total_seconds() // 60)
+    if recurrence_end:
+        rp.PatternEndDate = com_date(parse_dt(recurrence_end).replace(hour=0, minute=0, second=0))
+    elif occurrences:
+        rp.Occurrences = int(occurrences)
     else:
         rp.NoEndDate = True
     try:
-        fine_serie = None if rp.NoEndDate else fmt(rp.PatternEndDate)
+        series_end = None if rp.NoEndDate else fmt(rp.PatternEndDate)
     except Exception:  # noqa: BLE001
-        fine_serie = None
-    return {"tipo": k, "intervallo": rp.Interval, "giorni": giorni_settimana or None,
-            "fine": fine_serie, "occorrenze": (int(occorrenze) if occorrenze and not fine_ricorrenza else None)}
+        series_end = None
+    return {"type": k, "interval": rp.Interval, "weekdays": weekdays or None,
+            "end": series_end, "occurrences": (int(occurrences) if occurrences and not recurrence_end else None)}
 
 
 @mcp.tool(annotations=RW)
-async def crea_evento(oggetto: str, inizio: str, fine: str | None = None, durata_minuti: int | None = 30,
-                      descrizione: str = "", luogo: str = "", tutto_il_giorno: bool = False,
-                      etichetta: str | None = None, categorie: str | None = None, promemoria_minuti: int | None = 15,
-                      casella: str | None = None, calendario_nome: str | None = None,
-                      ricorrenza: str | None = None, intervallo: int | None = None, giorni_settimana: str | None = None,
-                      fine_ricorrenza: str | None = None, occorrenze: int | None = None) -> dict:
-    """Crea un evento o un memo nel calendario (predefinito: Calendario della casella predefinita).
-    Date 'AAAA-MM-GG HH:MM'. Etichette (colori, visibili con server che le supportano, per esempio Kerio): telefonata
-    (giallo, per i memo), lavoro, importante, personale, vacanza, da_non_perdere, viaggio, preparazione, compleanno,
-    anniversario, nessuna. Categorie separate da ';'. promemoria_minuti = -1 per nessun promemoria. Non invia inviti.
-    SERIE (opzionale): ricorrenza = giornaliera | settimanale | mensile | annuale; intervallo = ogni quanti giorni,
-    settimane, mesi o anni (predefinito 1); giorni_settimana per la settimanale, es. "lun,mer,ven" (predefinito: il
-    giorno di inizio); fine_ricorrenza = 'AAAA-MM-GG' oppure occorrenze = numero di volte; senza fine la serie
-    non termina. Esempio: "ogni venerdì per 5 volte" = ricorrenza=settimanale, giorni_settimana=ven, occorrenze=5."""
-    richiede_fase(3)
+async def create_event(subject: str, start: str, end: str | None = None, duration_minutes: int | None = 30,
+                       description: str = "", location: str = "", all_day: bool = False,
+                       label: str | None = None, categories: str | None = None, reminder_minutes: int | None = 15,
+                       mailbox: str | None = None, calendar_name: str | None = None,
+                       recurrence: str | None = None, interval: int | None = None, weekdays: str | None = None,
+                       recurrence_end: str | None = None, occurrences: int | None = None) -> dict:
+    """Creates an event or a memo in the calendar (default: Calendar of the default mailbox). Dates 'YYYY-MM-DD HH:MM'.
+    Labels (colours, visible with servers that support them, e.g. Kerio): phone_call (yellow, for memos), business,
+    important, personal, vacation, must_attend, travel, needs_preparation, birthday, anniversary, none.
+    Categories separated by ';'. reminder_minutes = -1 for no reminder. Never sends invitations.
+    SERIES (optional): recurrence = daily | weekly | monthly | yearly; interval = every how many days, weeks, months or
+    years (default 1); weekdays for weekly, e.g. "mon,wed,fri" (default: the start day); recurrence_end = 'YYYY-MM-DD'
+    or occurrences = number of times; with neither, the series never ends.
+    Example: "every Friday, 5 times" = recurrence=weekly, weekdays=fri, occurrences=5."""
+    require_phase(3)
 
     def f():
-        store = store_da_alias(casella)
-        cal = calendario(store, calendario_nome)
-        e = cal.Items.Add(1)  # olAppointmentItem: un appuntamento semplice, mai una riunione
-        _applica_evento(e, oggetto, inizio, fine, durata_minuti, descrizione, luogo, tutto_il_giorno,
-                        etichetta, categorie, promemoria_minuti)
-        serie = None
-        if ricorrenza:
-            serie = _applica_ricorrenza(e, ricorrenza, intervallo, giorni_settimana, fine_ricorrenza, occorrenze)
+        store = store_from_alias(mailbox)
+        cal = calendar(store, calendar_name)
+        e = cal.Items.Add(1)  # olAppointmentItem: a plain appointment, never a meeting
+        _apply_event(e, subject, start, end, duration_minutes, description, location, all_day,
+                     label, categories, reminder_minutes)
+        series = None
+        if recurrence:
+            series = _apply_recurrence(e, recurrence, interval, weekdays, recurrence_end, occurrences)
         try:
-            e.MeetingStatus = 0  # olNonMeeting: nessun invito, niente da spedire
+            e.MeetingStatus = 0  # olNonMeeting: no invitation, nothing to send
         except Exception:  # noqa: BLE001
             pass
         e.Save()
-        verifica_evento_puro(e)
-        # Controllo finale: l'evento deve stare proprio nel calendario richiesto (difesa contro provider che spostano).
+        check_plain_appointment(e)
+        # Final check: the event must sit in the requested calendar (defence against providers that move things).
         try:
             if e.Parent.EntryID != cal.EntryID:
-                raise ValueError(f"L'evento è stato salvato in '{e.Parent.FolderPath}' invece che nel calendario '{cal.FolderPath}': segnalarlo all'utente.")
+                raise ValueError(f"The event was saved in '{e.Parent.FolderPath}' instead of calendar '{cal.FolderPath}': tell the user.")
         except ValueError:
             raise
         except Exception:  # noqa: BLE001
             pass
-        audit("crea_evento", casella=casella or CASELLA_PREDEFINITA, calendario=cal.FolderPath, id=e.EntryID, oggetto=oggetto, serie=serie)
-        out = meta_evento(e, casella or CASELLA_PREDEFINITA, cal.FolderPath)
-        if serie:
-            out["serie"] = serie
+        audit("create_event", mailbox=mailbox or DEFAULT_MAILBOX, calendar=cal.FolderPath, id=e.EntryID, subject=subject, series=series)
+        out = event_meta(e, mailbox or DEFAULT_MAILBOX, cal.FolderPath)
+        if series:
+            out["series"] = series
         return out
     return await com(f)
 
 
-def occorrenza_di(e, data_occorrenza: str):
-    """Restituisce la singola occorrenza di una serie che inizia alla data e ora indicate ('AAAA-MM-GG HH:MM', come
-    il campo 'inizio' restituito da elenca_eventi), tramite RecurrencePattern.GetOccurrence. Errore chiaro se l'evento
-    non è una serie o nessuna occorrenza inizia esattamente a quell'ora."""
+def occurrence_of(e, occurrence_date: str):
+    """Returns the single occurrence of a series that starts at the given date and time ('YYYY-MM-DD HH:MM', as the
+    'start' field returned by list_events), through RecurrencePattern.GetOccurrence. Clear error when the event is not
+    a series or no occurrence starts exactly then."""
     if not bool(e.IsRecurring):
-        raise ValueError("L'evento non è una serie: data_occorrenza vale solo per gli eventi ricorrenti.")
-    quando = parse_dt(data_occorrenza)
+        raise ValueError("The event is not a series: occurrence_date applies to recurring events only.")
+    when = parse_dt(occurrence_date)
     rp = e.GetRecurrencePattern()
     try:
-        return rp.GetOccurrence(com_data(quando))
+        return rp.GetOccurrence(com_date(when))
     except Exception as ex:  # noqa: BLE001
-        raise ValueError(f"Nessuna occorrenza della serie inizia il {quando.strftime('%d.%m.%Y alle %H:%M')}: usare l'inizio esatto riportato da elenca_eventi. ({ex})") from ex
+        raise ValueError(f"No occurrence of the series starts on {when.strftime('%Y-%m-%d at %H:%M')}: use the exact start reported by list_events. ({ex})") from ex
 
 
 @mcp.tool(annotations=RW)
-async def modifica_evento(id: str, oggetto: str | None = None, inizio: str | None = None, fine: str | None = None,
-                          durata_minuti: int | None = None, descrizione: str | None = None, luogo: str | None = None,
-                          tutto_il_giorno: bool | None = None, etichetta: str | None = None, categorie: str | None = None,
-                          promemoria_minuti: int | None = None, casella: str | None = None,
-                          data_occorrenza: str | None = None) -> dict:
-    """Modifica solo i campi indicati di un evento o memo (id da elenca_eventi). Per un evento ricorrente modifica
-    l'intera serie, oppure una sola occorrenza se si passa data_occorrenza ('AAAA-MM-GG HH:MM', l'inizio riportato
-    da elenca_eventi): quella occorrenza diventa un'eccezione della serie. Non cancella mai."""
-    richiede_fase(3)
+async def update_event(id: str, subject: str | None = None, start: str | None = None, end: str | None = None,
+                       duration_minutes: int | None = None, description: str | None = None, location: str | None = None,
+                       all_day: bool | None = None, label: str | None = None, categories: str | None = None,
+                       reminder_minutes: int | None = None, mailbox: str | None = None,
+                       occurrence_date: str | None = None) -> dict:
+    """Updates only the given fields of an event or memo (id from list_events). For a recurring event it updates the
+    whole series, or a single occurrence when occurrence_date is given ('YYYY-MM-DD HH:MM', the start reported by
+    list_events): that occurrence becomes an exception of the series. Never deletes."""
+    require_phase(3)
 
     def f():
-        e, _ = elemento(id, casella)
-        verifica_classe(e, 26, "un evento")
-        verifica_evento_puro(e)
-        bersaglio = occorrenza_di(e, data_occorrenza) if data_occorrenza else e
-        _applica_evento(bersaglio, oggetto, inizio, fine, durata_minuti, descrizione, luogo, tutto_il_giorno,
-                        etichetta, categorie, promemoria_minuti)
-        bersaglio.Save()
-        audit("modifica_evento", casella=casella or CASELLA_PREDEFINITA, id=id, occorrenza=data_occorrenza)
-        out = meta_evento(bersaglio, casella or CASELLA_PREDEFINITA)
-        if data_occorrenza:
+        e, _ = item_by_id(id, mailbox)
+        check_class(e, 26, "an event")
+        check_plain_appointment(e)
+        target = occurrence_of(e, occurrence_date) if occurrence_date else e
+        _apply_event(target, subject, start, end, duration_minutes, description, location, all_day,
+                     label, categories, reminder_minutes)
+        target.Save()
+        audit("update_event", mailbox=mailbox or DEFAULT_MAILBOX, id=id, occurrence=occurrence_date)
+        out = event_meta(target, mailbox or DEFAULT_MAILBOX)
+        if occurrence_date:
             out["id"] = id
-            out["occorrenza_modificata"] = data_occorrenza
-            out["nota"] = "modificata solo questa occorrenza (eccezione della serie); l'id resta quello della serie"
+            out["updated_occurrence"] = occurrence_date
+            out["note"] = "only this occurrence was updated (exception of the series); the id remains the series id"
         return out
     return await com(f)
 
 
-# ---------------------------------------------------------------- fase 4: avvisi (unica eccezione all'invio)
+# ---------------------------------------------------------------- phase 4: alerts (the only exception to "no sending")
 
 @mcp.tool(annotations=RW)
-async def invia_avviso(oggetto: str, corpo: str) -> dict:
-    """Invia un avviso automatico (per esempio da un'attività programmata) all'utente stesso. Mittente e destinatario
-    sono fissi nella configurazione del connettore e NON sono parametri: è l'unica funzione di invio e non può scrivere
-    a nessun altro. Testo semplice."""
-    richiede_fase(4)
-    if not AVVISO_MITTENTE or not AVVISO_DESTINATARIO:
-        raise ToolError('Avvisi non configurati: in config.json manca la sezione "avviso" con "mittente" e "destinatario".')
+async def send_alert(subject: str, body: str) -> dict:
+    """Sends an automatic alert (for example from a scheduled task) to the user themselves. Sender and recipient are
+    fixed in the server configuration and are NOT parameters: this is the only sending tool and it cannot write to
+    anyone else. Plain text."""
+    require_phase(4)
+    if not ALERT_SENDER or not ALERT_RECIPIENT:
+        raise ToolError('Alerts not configured: config.json lacks the "alert" section with "sender" and "recipient".')
 
     def f():
-        # L'account mittente deve esistere in Outlook: si cerca per indirizzo SMTP.
+        # The sending account must exist in Outlook: looked up by SMTP address.
         acc = None
         for a in ns().Accounts:
-            if (a.SmtpAddress or "").lower() == AVVISO_MITTENTE:
+            if (a.SmtpAddress or "").lower() == ALERT_SENDER:
                 acc = a
                 break
         if acc is None:
-            raise RuntimeError(f"Account mittente {AVVISO_MITTENTE} non trovato in Outlook.")
+            raise RuntimeError(f"Sender account {ALERT_SENDER} not found in Outlook.")
         m = COM.outlook().CreateItem(0)  # olMailItem
         m.SendUsingAccount = acc
-        m.To = AVVISO_DESTINATARIO
-        m.Subject = AVVISO_PREFISSO + oggetto
-        m.Body = corpo
-        if m.To != AVVISO_DESTINATARIO:  # difesa in profondità: nessun altro destinatario possibile
-            raise RuntimeError("Destinatario non conforme.")
-        oggetto_finale = m.Subject  # dopo Send() l'oggetto COM non è più leggibile: i dati si prendono prima
+        m.To = ALERT_RECIPIENT
+        m.Subject = ALERT_PREFIX + subject
+        m.Body = body
+        if m.To != ALERT_RECIPIENT:  # defence in depth: no other recipient is possible
+            raise RuntimeError("Recipient not compliant.")
+        final_subject = m.Subject  # after Send() the COM object is no longer readable: take the data first
         m.Send()
-        audit("invia_avviso", oggetto=oggetto_finale)
-        return {"inviato": True, "da": AVVISO_MITTENTE, "a": AVVISO_DESTINATARIO, "oggetto": oggetto_finale}
+        audit("send_alert", subject=final_subject)
+        return {"sent": True, "from": ALERT_SENDER, "to": ALERT_RECIPIENT, "subject": final_subject}
     return await com(f)
 
 
-# ---------------------------------------------------------------- rubrica (contatti)
+# ---------------------------------------------------------------- contacts
 
 @mcp.tool(annotations=RO)
-async def cerca_contatti(testo: str, casella: str | None = None, cartella: str | None = None, massimo: int = 30) -> list[dict]:
-    """Cerca persone e aziende nella rubrica per nome, cognome, azienda, indirizzo email o numero di telefono.
-    Senza 'cartella' cerca in tutte le cartelle di contatti della casella (Contatti e sottocartelle, altre rubriche).
-    Restituisce i dati principali; per la scheda completa usare leggi_contatto."""
+async def search_contacts(text: str, mailbox: str | None = None, folder: str | None = None, limit: int = 30) -> list[dict]:
+    """Searches people and companies in the address book by first name, last name, company, e-mail address or phone
+    number. Without 'folder' it searches every contacts folder of the mailbox (Contacts and subfolders, other address
+    books). Returns the main fields; use read_contact for the full card."""
     def f():
-        store = store_da_alias(casella)
-        cartelle = [cartella_da_percorso(store, cartella)] if cartella else cartelle_di_tipo(store, 2)
-        t = dasl_lit(testo)
-        # Filtro DASL su tutti i campi utili: un solo passaggio sul server invece di leggere ogni contatto.
-        # Se il provider non supporta il filtro (com_error), si ripiega sulla scansione dei campi principali.
-        campi = ["urn:schemas:contacts:cn", "urn:schemas:contacts:fileas", "urn:schemas:contacts:givenName",
-                 "urn:schemas:contacts:sn", "urn:schemas:contacts:o", "urn:schemas:contacts:email1",
-                 "urn:schemas:contacts:email2", "urn:schemas:contacts:telephoneNumber", "urn:schemas:contacts:mobile",
-                 "urn:schemas:contacts:homePhone"]
-        filtro = "@SQL=" + " OR ".join(f"\"{c}\" LIKE '%{t}%'" for c in campi)
+        store = store_from_alias(mailbox)
+        folders = [folder_from_path(store, folder)] if folder else folders_of_type(store, 2)
+        t = dasl_lit(text)
+        # DASL filter on every useful field: one server-side pass instead of reading every contact.
+        # If the provider does not support the filter (com_error), fall back to scanning the main fields.
+        fields = ["urn:schemas:contacts:cn", "urn:schemas:contacts:fileas", "urn:schemas:contacts:givenName",
+                  "urn:schemas:contacts:sn", "urn:schemas:contacts:o", "urn:schemas:contacts:email1",
+                  "urn:schemas:contacts:email2", "urn:schemas:contacts:telephoneNumber", "urn:schemas:contacts:mobile",
+                  "urn:schemas:contacts:homePhone"]
+        flt = "@SQL=" + " OR ".join(f"\"{c}\" LIKE '%{t}%'" for c in fields)
         out: list[dict] = []
-        lim = max(1, min(massimo, 200))
-        for fold in cartelle:
+        lim = max(1, min(limit, 200))
+        for fold in folders:
             try:
-                items = fold.Items.Restrict(filtro)
-                for c in itera(items, lim - len(out)):
+                items = fold.Items.Restrict(flt)
+                for c in iterate(items, lim - len(out)):
                     if c.Class == 40:
-                        out.append(meta_contatto(c, casella or CASELLA_PREDEFINITA))
+                        out.append(contact_meta(c, mailbox or DEFAULT_MAILBOX))
             except pywintypes.com_error:
-                # ripiego: scansione semplice sui campi principali
-                tl = testo.lower()
-                for c in itera(fold.Items, 2000):
+                tl = text.lower()
+                for c in iterate(fold.Items, 2000):
                     try:
                         if c.Class != 40:
                             continue
                         blob = " ".join(str(getattr(c, a) or "") for a in ("FullName", "CompanyName", "Email1Address", "MobileTelephoneNumber", "BusinessTelephoneNumber"))
                         if tl in blob.lower():
-                            out.append(meta_contatto(c, casella or CASELLA_PREDEFINITA))
+                            out.append(contact_meta(c, mailbox or DEFAULT_MAILBOX))
                             if len(out) >= lim:
                                 break
                     except Exception:  # noqa: BLE001
@@ -1477,383 +1456,391 @@ async def cerca_contatti(testo: str, casella: str | None = None, cartella: str |
 
 
 @mcp.tool(annotations=RO)
-async def elenca_contatti(casella: str | None = None, cartella: str = "Contatti", massimo: int = 100) -> list[dict]:
-    """Elenca i contatti di una cartella della rubrica (predefinita: Contatti; altre per percorso, per esempio
-    'Contatti/<sottocartella>', vedi elenca_cartelle), in ordine alfabetico."""
+async def list_contacts(mailbox: str | None = None, folder: str | None = None, limit: int = 100) -> list[dict]:
+    """Lists the contacts of an address book folder (default: Contacts; others by path, e.g. 'Contacts/<subfolder>',
+    see list_folders), in alphabetical order."""
     def f():
-        store = store_da_alias(casella)
-        fold = cartella_da_percorso(store, cartella)
+        store = store_from_alias(mailbox)
+        fold = folder_from_path(store, folder) if folder else default_folder(store, 10, "Contacts", "Contatti", "Kontakte", "Contactos")
         items = fold.Items
         items.Sort("[FileAs]")
-        return [meta_contatto(c, casella or CASELLA_PREDEFINITA) for c in itera(items, max(1, min(massimo, 500))) if c.Class == 40]
+        return [contact_meta(c, mailbox or DEFAULT_MAILBOX) for c in iterate(items, max(1, min(limit, 500))) if c.Class == 40]
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def leggi_contatto(id: str, casella: str | None = None) -> dict:
-    """Legge la scheda completa di un contatto (id da cerca_contatti/elenca_contatti)."""
+async def read_contact(id: str, mailbox: str | None = None) -> dict:
+    """Reads the full card of a contact (id from search_contacts/list_contacts)."""
     def f():
-        c, _ = elemento(id, casella)
-        verifica_classe(c, 40, "un contatto")
-        return meta_contatto(c, casella or CASELLA_PREDEFINITA, completo=True)
+        c, _ = item_by_id(id, mailbox)
+        check_class(c, 40, "a contact")
+        return contact_meta(c, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def crea_contatto(nome: str = "", cognome: str = "", azienda: str = "", ruolo: str = "", email: str = "",
-                        email2: str = "", tel_lavoro: str = "", cellulare: str = "", tel_casa: str = "",
-                        indirizzo_lavoro: str = "", sito_web: str = "", note: str = "", categorie: str = "",
-                        casella: str | None = None, cartella: str = "Contatti") -> dict:
-    """Crea un contatto nella rubrica (cartella predefinita: Contatti della casella predefinita). Serve almeno
-    nome, cognome o azienda. Non cancella e non modifica contatti esistenti: per quello usare modifica_contatto."""
-    richiede_fase(2)
+async def create_contact(first_name: str = "", last_name: str = "", company: str = "", job_title: str = "",
+                         email: str = "", email2: str = "", business_phone: str = "", mobile_phone: str = "",
+                         home_phone: str = "", business_address: str = "", website: str = "", notes: str = "",
+                         categories: str = "", mailbox: str | None = None, folder: str | None = None) -> dict:
+    """Creates a contact in the address book (default folder: Contacts of the default mailbox). At least one of
+    first_name, last_name or company is required. Never deletes or edits existing contacts: use update_contact."""
+    require_phase(2)
 
     def f():
-        if not (nome or cognome or azienda):
-            raise ValueError("Indicare almeno nome, cognome o azienda.")
-        store = store_da_alias(casella)
-        fold = cartella_da_percorso(store, cartella)
-        c = fold.Items.Add(2)
-        _applica_contatto(c, nome, cognome, azienda, ruolo, email, email2, tel_lavoro, cellulare, tel_casa,
-                          indirizzo_lavoro, sito_web, note, categorie)
+        if not (first_name or last_name or company):
+            raise ValueError("Give at least a first name, a last name or a company.")
+        store = store_from_alias(mailbox)
+        fold = folder_from_path(store, folder) if folder else default_folder(store, 10, "Contacts", "Contatti", "Kontakte", "Contactos")
+        c = fold.Items.Add(2)  # olContactItem
+        _apply_contact(c, first_name, last_name, company, job_title, email, email2, business_phone, mobile_phone,
+                       home_phone, business_address, website, notes, categories)
         c.Save()
-        audit("crea_contatto", casella=casella or CASELLA_PREDEFINITA, cartella=fold.FolderPath, id=c.EntryID)
-        return meta_contatto(c, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("create_contact", mailbox=mailbox or DEFAULT_MAILBOX, folder=fold.FolderPath, id=c.EntryID)
+        return contact_meta(c, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def modifica_contatto(id: str, nome: str | None = None, cognome: str | None = None, azienda: str | None = None,
-                            ruolo: str | None = None, email: str | None = None, email2: str | None = None,
-                            tel_lavoro: str | None = None, cellulare: str | None = None, tel_casa: str | None = None,
-                            indirizzo_lavoro: str | None = None, sito_web: str | None = None, note: str | None = None,
-                            categorie: str | None = None, casella: str | None = None) -> dict:
-    """Modifica solo i campi indicati di un contatto esistente (id da cerca_contatti). Non cancella mai."""
-    richiede_fase(2)
+async def update_contact(id: str, first_name: str | None = None, last_name: str | None = None, company: str | None = None,
+                         job_title: str | None = None, email: str | None = None, email2: str | None = None,
+                         business_phone: str | None = None, mobile_phone: str | None = None, home_phone: str | None = None,
+                         business_address: str | None = None, website: str | None = None, notes: str | None = None,
+                         categories: str | None = None, mailbox: str | None = None) -> dict:
+    """Updates only the given fields of an existing contact (id from search_contacts). Never deletes."""
+    require_phase(2)
 
     def f():
-        c, _ = elemento(id, casella)
-        verifica_classe(c, 40, "un contatto")
-        _applica_contatto(c, nome, cognome, azienda, ruolo, email, email2, tel_lavoro, cellulare, tel_casa,
-                          indirizzo_lavoro, sito_web, note, categorie)
+        c, _ = item_by_id(id, mailbox)
+        check_class(c, 40, "a contact")
+        _apply_contact(c, first_name, last_name, company, job_title, email, email2, business_phone, mobile_phone,
+                       home_phone, business_address, website, notes, categories)
         c.Save()
-        audit("modifica_contatto", casella=casella or CASELLA_PREDEFINITA, id=id)
-        return meta_contatto(c, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("update_contact", mailbox=mailbox or DEFAULT_MAILBOX, id=id)
+        return contact_meta(c, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
-# ---------------------------------------------------------------- attività
+# ---------------------------------------------------------------- tasks
+
+def tasks_folder(store, folder: str | None):
+    return folder_from_path(store, folder) if folder else default_folder(store, 13, "Tasks", "Attività", "Aufgaben", "Tâches", "Tareas")
+
+
+def notes_folder(store):
+    return default_folder(store, 12, "Notes", "Note", "Notizen", "Notas")
+
 
 @mcp.tool(annotations=RO)
-async def elenca_attivita(casella: str | None = None, solo_aperte: bool = True, massimo: int = 100,
-                          cartella: str | None = None) -> list[dict]:
-    """Elenca le attività (cartella Attività della casella), per data di scadenza. solo_aperte=false include le completate."""
+async def list_tasks(mailbox: str | None = None, open_only: bool = True, limit: int = 100,
+                     folder: str | None = None) -> list[dict]:
+    """Lists the tasks (Tasks folder of the mailbox) by due date. open_only=false includes completed ones."""
     def f():
-        store = store_da_alias(casella)
-        fold = cartella_da_percorso(store, cartella) if cartella else cartella_predefinita(store, 13, "Attività", "Tasks")
+        store = store_from_alias(mailbox)
+        fold = tasks_folder(store, folder)
         items = fold.Items
         items.Sort("[DueDate]")
-        if solo_aperte:
+        if open_only:
             items = items.Restrict("[Complete] = False")
-        return [meta_attivita(t, casella or CASELLA_PREDEFINITA) for t in itera(items, max(1, min(massimo, 500))) if t.Class == 48]
+        return [task_meta(t, mailbox or DEFAULT_MAILBOX) for t in iterate(items, max(1, min(limit, 500))) if t.Class == 48]
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def leggi_attivita(id: str, casella: str | None = None) -> dict:
-    """Legge un'attività completa (id da elenca_attivita)."""
+async def read_task(id: str, mailbox: str | None = None) -> dict:
+    """Reads a full task (id from list_tasks)."""
     def f():
-        t, _ = elemento(id, casella)
-        verifica_classe(t, 48, "un'attività")
-        return meta_attivita(t, casella or CASELLA_PREDEFINITA, completo=True)
+        t, _ = item_by_id(id, mailbox)
+        check_class(t, 48, "a task")
+        return task_meta(t, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def crea_attivita(oggetto: str, scadenza: str | None = None, inizio: str | None = None, descrizione: str = "",
-                        priorita: str = "normale", promemoria: str | None = None, categorie: str = "",
-                        casella: str | None = None, cartella: str | None = None) -> dict:
-    """Crea un'attività (cartella Attività della casella predefinita). Date 'AAAA-MM-GG' o 'AAAA-MM-GG HH:MM';
-    priorita: bassa, normale, alta; promemoria = data e ora del promemoria."""
-    richiede_fase(2)
+async def create_task(subject: str, due_date: str | None = None, start_date: str | None = None, description: str = "",
+                      priority: str = "normal", reminder: str | None = None, categories: str = "",
+                      mailbox: str | None = None, folder: str | None = None) -> dict:
+    """Creates a task (Tasks folder of the default mailbox). Dates 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM';
+    priority: low, normal, high; reminder = date and time of the reminder."""
+    require_phase(2)
 
     def f():
-        store = store_da_alias(casella)
-        fold = cartella_da_percorso(store, cartella) if cartella else cartella_predefinita(store, 13, "Attività", "Tasks")
-        t = fold.Items.Add(3)
-        _applica_attivita(t, oggetto, scadenza, inizio, descrizione, priorita, promemoria, categorie, None, None)
+        store = store_from_alias(mailbox)
+        fold = tasks_folder(store, folder)
+        t = fold.Items.Add(3)  # olTaskItem
+        _apply_task(t, subject, due_date, start_date, description, priority, reminder, categories, None, None)
         t.Save()
-        audit("crea_attivita", casella=casella or CASELLA_PREDEFINITA, cartella=fold.FolderPath, id=t.EntryID, oggetto=oggetto)
-        return meta_attivita(t, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("create_task", mailbox=mailbox or DEFAULT_MAILBOX, folder=fold.FolderPath, id=t.EntryID, subject=subject)
+        return task_meta(t, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def modifica_attivita(id: str, oggetto: str | None = None, scadenza: str | None = None, inizio: str | None = None,
-                            descrizione: str | None = None, priorita: str | None = None, promemoria: str | None = None,
-                            categorie: str | None = None, completata: bool | None = None, percentuale: int | None = None,
-                            casella: str | None = None) -> dict:
-    """Modifica solo i campi indicati di un'attività; completata=true la segna come completata, false la riapre.
-    promemoria='' toglie il promemoria. Non cancella mai."""
-    richiede_fase(2)
+async def update_task(id: str, subject: str | None = None, due_date: str | None = None, start_date: str | None = None,
+                      description: str | None = None, priority: str | None = None, reminder: str | None = None,
+                      categories: str | None = None, complete: bool | None = None, percent_complete: int | None = None,
+                      mailbox: str | None = None) -> dict:
+    """Updates only the given fields of a task; complete=true marks it done, false reopens it. reminder='' removes the
+    reminder. Never deletes."""
+    require_phase(2)
 
     def f():
-        t, _ = elemento(id, casella)
-        verifica_classe(t, 48, "un'attività")
-        _applica_attivita(t, oggetto, scadenza, inizio, descrizione, priorita, promemoria, categorie, completata, percentuale)
+        t, _ = item_by_id(id, mailbox)
+        check_class(t, 48, "a task")
+        _apply_task(t, subject, due_date, start_date, description, priority, reminder, categories, complete, percent_complete)
         t.Save()
-        audit("modifica_attivita", casella=casella or CASELLA_PREDEFINITA, id=id, completata=completata)
-        return meta_attivita(t, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("update_task", mailbox=mailbox or DEFAULT_MAILBOX, id=id, complete=complete)
+        return task_meta(t, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
-# ---------------------------------------------------------------- note
+# ---------------------------------------------------------------- notes
 
 @mcp.tool(annotations=RO)
-async def elenca_note(casella: str | None = None, massimo: int = 100) -> list[dict]:
-    """Elenca le note (cartella Note della casella), dalla più recente."""
+async def list_notes(mailbox: str | None = None, limit: int = 100) -> list[dict]:
+    """Lists the notes (Notes folder of the mailbox), most recent first."""
     def f():
-        store = store_da_alias(casella)
-        fold = cartella_predefinita(store, 12, "Note", "Notes")
+        store = store_from_alias(mailbox)
+        fold = notes_folder(store)
         items = fold.Items
         items.Sort("[LastModificationTime]", True)
-        return [meta_nota(n, casella or CASELLA_PREDEFINITA) for n in itera(items, max(1, min(massimo, 500))) if n.Class == 44]
+        return [note_meta(n, mailbox or DEFAULT_MAILBOX) for n in iterate(items, max(1, min(limit, 500))) if n.Class == 44]
     return await com(f)
 
 
 @mcp.tool(annotations=RO)
-async def leggi_nota(id: str, casella: str | None = None) -> dict:
-    """Legge il testo completo di una nota (id da elenca_note)."""
+async def read_note(id: str, mailbox: str | None = None) -> dict:
+    """Reads the full text of a note (id from list_notes)."""
     def f():
-        n, _ = elemento(id, casella)
-        verifica_classe(n, 44, "una nota")
-        return meta_nota(n, casella or CASELLA_PREDEFINITA, completo=True)
+        n, _ = item_by_id(id, mailbox)
+        check_class(n, 44, "a note")
+        return note_meta(n, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def crea_nota(testo: str, categorie: str = "", casella: str | None = None) -> dict:
-    """Crea una nota (la prima riga del testo diventa il titolo)."""
-    richiede_fase(2)
+async def create_note(text: str, categories: str = "", mailbox: str | None = None) -> dict:
+    """Creates a note (the first line of the text becomes the title)."""
+    require_phase(2)
 
     def f():
-        store = store_da_alias(casella)
-        fold = cartella_predefinita(store, 12, "Note", "Notes")
-        n = fold.Items.Add(5)
-        n.Body = testo
-        if categorie:
-            n.Categories = categorie
+        store = store_from_alias(mailbox)
+        fold = notes_folder(store)
+        n = fold.Items.Add(5)  # olNoteItem
+        n.Body = text
+        if categories:
+            n.Categories = categories
         n.Save()
-        audit("crea_nota", casella=casella or CASELLA_PREDEFINITA, id=n.EntryID)
-        return meta_nota(n, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("create_note", mailbox=mailbox or DEFAULT_MAILBOX, id=n.EntryID)
+        return note_meta(n, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def modifica_nota(id: str, testo: str | None = None, categorie: str | None = None, casella: str | None = None) -> dict:
-    """Sostituisce il testo e/o le categorie di una nota esistente. Non cancella mai."""
-    richiede_fase(2)
+async def update_note(id: str, text: str | None = None, categories: str | None = None, mailbox: str | None = None) -> dict:
+    """Replaces the text and/or the categories of an existing note. Never deletes."""
+    require_phase(2)
 
     def f():
-        n, _ = elemento(id, casella)
-        verifica_classe(n, 44, "una nota")
-        if testo is not None:
-            n.Body = testo
-        if categorie is not None:
-            n.Categories = categorie
+        n, _ = item_by_id(id, mailbox)
+        check_class(n, 44, "a note")
+        if text is not None:
+            n.Body = text
+        if categories is not None:
+            n.Categories = categories
         n.Save()
-        audit("modifica_nota", casella=casella or CASELLA_PREDEFINITA, id=id)
-        return meta_nota(n, casella or CASELLA_PREDEFINITA, completo=True)
+        audit("update_note", mailbox=mailbox or DEFAULT_MAILBOX, id=id)
+        return note_meta(n, mailbox or DEFAULT_MAILBOX, full=True)
     return await com(f)
 
 
-# ---------------------------------------------------------------- cartelle e spostamenti
+# ---------------------------------------------------------------- folders and moves
 
 @mcp.tool(annotations=RW)
-async def crea_cartella(nome: str, percorso_padre: str = "", tipo: str = "posta", casella: str | None = None) -> dict:
-    """Crea una sottocartella (tipo: posta, calendario, contatti, attivita, note) sotto 'percorso_padre'
-    (vuoto = radice della casella). Non rinomina e non cancella cartelle."""
-    richiede_fase(2)
+async def create_folder(name: str, parent_path: str = "", type: str = "mail", mailbox: str | None = None) -> dict:
+    """Creates a subfolder (type: mail, calendar, contacts, tasks, notes) under 'parent_path' (empty = mailbox root).
+    Never renames or deletes folders."""
+    require_phase(2)
 
     def f():
-        codici = {"posta": 6, "calendario": 9, "contatti": 10, "attivita": 13, "note": 12}
-        if tipo not in codici:
-            raise ValueError("Tipo non valido: posta, calendario, contatti, attivita, note.")
-        store = store_da_alias(casella)
-        padre = cartella_da_percorso(store, percorso_padre)
-        for sub in padre.Folders:
-            if sub.Name.lower() == nome.lower():
-                raise ValueError(f"Esiste già una cartella '{sub.Name}' in '{padre.FolderPath}'.")
-        nuova = padre.Folders.Add(nome, codici[tipo])
-        audit("crea_cartella", casella=casella or CASELLA_PREDEFINITA, cartella=nuova.FolderPath)
-        return {"percorso": nuova.FolderPath, "tipo": tipo}
+        codes = {"mail": 6, "calendar": 9, "contacts": 10, "tasks": 13, "notes": 12}
+        if type not in codes:
+            raise ValueError("Invalid type: mail, calendar, contacts, tasks, notes.")
+        store = store_from_alias(mailbox)
+        parent = folder_from_path(store, parent_path)
+        for sub in parent.Folders:
+            if sub.Name.lower() == name.lower():
+                raise ValueError(f"A folder '{sub.Name}' already exists in '{parent.FolderPath}'.")
+        new = parent.Folders.Add(name, codes[type])
+        audit("create_folder", mailbox=mailbox or DEFAULT_MAILBOX, folder=new.FolderPath)
+        return {"path": new.FolderPath, "type": type}
     return await com(f)
 
 
 @mcp.tool(annotations=RW)
-async def sposta_mail(id: str, cartella_destinazione: str, casella: str | None = None,
-                      casella_destinazione: str | None = None) -> dict:
-    """Sposta una mail in un'altra cartella (anche di un'altra casella). Rifiuta qualsiasi destinazione che sia
-    un cestino (Posta eliminata, Cestino, Trash): il connettore non cancella. Lo stato letto/non letto resta com'era."""
-    richiede_fase(2)
+async def move_mail(id: str, destination_folder: str, mailbox: str | None = None,
+                    destination_mailbox: str | None = None) -> dict:
+    """Moves a mail to another folder (also in another mailbox). Refuses any destination that is a trash
+    (Deleted Items, Trash...): this server does not delete here. The read/unread state is preserved."""
+    require_phase(2)
 
     def f():
-        item, store = elemento(id, casella)
-        verifica_classe(item, 43, "una mail")
-        store_dest = store_da_alias(casella_destinazione) if casella_destinazione else store
-        dest = cartella_da_percorso(store_dest, cartella_destinazione)
-        if e_cestino(store_dest, dest):
-            raise ValueError("Destinazione rifiutata: è un cestino, e il connettore non cancella.")
+        item, store = item_by_id(id, mailbox)
+        check_class(item, 43, "a mail")
+        dest_store = store_from_alias(destination_mailbox) if destination_mailbox else store
+        dest = folder_from_path(dest_store, destination_folder)
+        if is_trash(dest_store, dest):
+            raise ValueError("Destination refused: it is a trash folder; use delete_mail to delete.")
         if dest.DefaultItemType != 0:
-            raise ValueError("La cartella di destinazione non è una cartella di posta.")
-        era_non_letta = bool(item.UnRead)
-        nuovo = item.Move(dest)
+            raise ValueError("The destination folder is not a mail folder.")
+        was_unread = bool(item.UnRead)
+        new = item.Move(dest)
         try:
-            if bool(nuovo.UnRead) != era_non_letta:
-                nuovo.UnRead = era_non_letta
-                nuovo.Save()
+            if bool(new.UnRead) != was_unread:
+                new.UnRead = was_unread
+                new.Save()
         except Exception:  # noqa: BLE001
             pass
-        audit("sposta_mail", casella=casella or CASELLA_PREDEFINITA, id=id, destinazione=dest.FolderPath, nuovo_id=nuovo.EntryID)
-        return {"id": nuovo.EntryID, "casella": casella_destinazione or casella or CASELLA_PREDEFINITA, "cartella": dest.FolderPath}
+        audit("move_mail", mailbox=mailbox or DEFAULT_MAILBOX, id=id, destination=dest.FolderPath, new_id=new.EntryID)
+        return {"id": new.EntryID, "mailbox": destination_mailbox or mailbox or DEFAULT_MAILBOX, "folder": dest.FolderPath}
     return await com(f)
 
 
-# ---------------------------------------------------------------- cancellazione (nel cestino, recuperabile)
+# ---------------------------------------------------------------- deletion (to the trash, recoverable)
 
-# Strumenti marcati come distruttivi: Claude desktop può chiedere conferma all'utente prima di eseguirli.
+# Tools flagged as destructive: Claude desktop may ask the user for confirmation before running them.
 DEL = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
 
 
-def richiede_cancellazione() -> None:
-    """Blocca gli strumenti di cancellazione se l'interruttore in config.json è spento (o assente)."""
-    if not CANCELLAZIONE:
-        raise ToolError('Cancellazione disattivata: in config.json "cancellazione_abilitata" non è true.')
+def require_deletion() -> None:
+    """Blocks the deletion tools when the switch in config.json is off (or absent)."""
+    if not DELETION:
+        raise ToolError('Deletion disabled: in config.json "deletion_enabled" is not true.')
 
 
-def cestino_di(store):
-    """Il cestino della casella: cartella predefinita 3 (olFolderDeletedItems), oppure, con provider che non la
-    dichiarano (IMAP, caselle PEC), una cartella di posta con uno dei nomi in NOMI_CESTINO nei primi due livelli."""
+def trash_of(store):
+    """The mailbox trash: default folder 3 (olFolderDeletedItems) or, with providers that do not declare it (IMAP),
+    a mail folder with one of the TRASH_NAMES in the first two levels."""
     try:
         return store.GetDefaultFolder(3)
     except Exception:  # noqa: BLE001
         pass
 
-    def walk(fold, liv):
+    def walk(fold, level):
         for sub in fold.Folders:
             try:
-                if sub.Name.lower() in NOMI_CESTINO and sub.DefaultItemType == 0:
+                if sub.Name.lower() in TRASH_NAMES and sub.DefaultItemType == 0:
                     return sub
             except Exception:  # noqa: BLE001
                 continue
-            if liv < 2:
-                r = walk(sub, liv + 1)
+            if level < 2:
+                r = walk(sub, level + 1)
                 if r is not None:
                     return r
         return None
 
     f = walk(store.GetRootFolder(), 1)
     if f is None:
-        raise ValueError("Questa casella non ha un cestino riconoscibile: cancellazione rifiutata.")
+        raise ValueError("This mailbox has no recognisable trash folder: deletion refused.")
     return f
 
 
-def controlla_oggetto(item, oggetto_atteso: str) -> str:
-    """Prima di cancellare, l'oggetto reale deve coincidere con quello che l'utente ha confermato: protegge da un id
-    sbagliato o da un elemento spostato nel frattempo."""
-    reale = (item.Subject or "").strip()
-    if reale != (oggetto_atteso or "").strip():
-        raise ValueError(f"Cancellazione rifiutata: l'oggetto reale è «{reale}», diverso da quello confermato «{oggetto_atteso}».")
-    return reale
+def check_subject(item, expected_subject: str) -> str:
+    """Before deleting, the real subject must match the one the user confirmed: protects against a wrong id or an
+    item moved in the meantime."""
+    real = (item.Subject or "").strip()
+    if real != (expected_subject or "").strip():
+        raise ValueError(f"Deletion refused: the real subject is \"{real}\", different from the confirmed \"{expected_subject}\".")
+    return real
 
 
 @mcp.tool(annotations=DEL)
-async def elimina_mail(id: str, oggetto_atteso: str, casella: str | None = None) -> dict:
-    """Sposta una mail nel cestino della sua casella (recuperabile). USARE SOLO dopo che l'utente ha confermato
-    in chat quella mail precisa. 'oggetto_atteso' deve coincidere con l'oggetto reale, altrimenti rifiuta.
-    Rifiuta le mail già nel cestino (niente cancellazione definitiva)."""
-    richiede_fase(2)
-    richiede_cancellazione()
+async def delete_mail(id: str, expected_subject: str, mailbox: str | None = None) -> dict:
+    """Moves a mail to the trash of its mailbox (recoverable). USE ONLY after the user has confirmed that precise mail
+    in chat. 'expected_subject' must match the real subject, otherwise it refuses.
+    Refuses mail already in the trash (no permanent deletion)."""
+    require_phase(2)
+    require_deletion()
 
     def f():
-        item, store = elemento(id, casella)
-        verifica_classe(item, 43, "una mail")
-        ogg = controlla_oggetto(item, oggetto_atteso)
-        if e_cestino(store, item.Parent):
-            raise ValueError("La mail è già nel cestino: la cancellazione definitiva non è permessa.")
-        dest = cestino_di(store)
-        origine = item.Parent.FolderPath
-        nuovo = item.Move(dest)
-        audit("elimina_mail", casella=casella or CASELLA_PREDEFINITA, id=id, oggetto=ogg, da=origine, a=dest.FolderPath)
-        return {"eliminata": True, "oggetto": ogg, "da": origine, "cestino": dest.FolderPath, "id_nel_cestino": nuovo.EntryID}
+        item, store = item_by_id(id, mailbox)
+        check_class(item, 43, "a mail")
+        subj = check_subject(item, expected_subject)
+        if is_trash(store, item.Parent):
+            raise ValueError("The mail is already in the trash: permanent deletion is not allowed.")
+        dest = trash_of(store)
+        origin = item.Parent.FolderPath
+        new = item.Move(dest)
+        audit("delete_mail", mailbox=mailbox or DEFAULT_MAILBOX, id=id, subject=subj, from_folder=origin, to_folder=dest.FolderPath)
+        return {"deleted": True, "subject": subj, "from_folder": origin, "trash": dest.FolderPath, "id_in_trash": new.EntryID}
     return await com(f)
 
 
 @mcp.tool(annotations=DEL)
-async def elimina_evento(id: str, oggetto_atteso: str, serie_intera: bool = False, casella: str | None = None,
-                         data_occorrenza: str | None = None) -> dict:
-    """Sposta un evento o memo del calendario nel cestino della sua casella (recuperabile). USARE SOLO dopo che
-    l'utente ha confermato in chat quell'evento preciso. 'oggetto_atteso' deve coincidere con l'oggetto reale.
-    Per un evento ricorrente: serie_intera=true cancella tutta la serie (nel cestino); data_occorrenza
-    ('AAAA-MM-GG HH:MM', l'inizio riportato da elenca_eventi) cancella SOLO quella occorrenza. ATTENZIONE: la singola
-    occorrenza non passa dal cestino (diventa un'eccezione della serie) e si recupera solo ricreandola: va detto
-    all'utente prima della conferma. Rifiuta le riunioni con invitati (cancellarle manderebbe disdette) e gli eventi
-    già nel cestino."""
-    richiede_fase(3)
-    richiede_cancellazione()
+async def delete_event(id: str, expected_subject: str, whole_series: bool = False, mailbox: str | None = None,
+                       occurrence_date: str | None = None) -> dict:
+    """Moves a calendar event or memo to the trash of its mailbox (recoverable). USE ONLY after the user has confirmed
+    that precise event in chat. 'expected_subject' must match the real subject.
+    For a recurring event: whole_series=true deletes the whole series (to the trash); occurrence_date
+    ('YYYY-MM-DD HH:MM', the start reported by list_events) deletes ONLY that occurrence. WARNING: a single occurrence
+    does not go through the trash (it becomes an exception of the series) and can only be recovered by recreating it:
+    tell the user before asking for confirmation. Refuses meetings with attendees (deleting them would send
+    cancellations) and events already in the trash."""
+    require_phase(3)
+    require_deletion()
 
     def f():
-        e, store = elemento(id, casella)
-        verifica_classe(e, 26, "un evento")
-        ogg = controlla_oggetto(e, oggetto_atteso)
-        if serie_intera and data_occorrenza:
-            raise ValueError("Indicare o serie_intera=true o data_occorrenza, non entrambi.")
+        e, store = item_by_id(id, mailbox)
+        check_class(e, 26, "an event")
+        subj = check_subject(e, expected_subject)
+        if whole_series and occurrence_date:
+            raise ValueError("Give either whole_series=true or occurrence_date, not both.")
         try:
-            stato = int(e.MeetingStatus)
+            status = int(e.MeetingStatus)
         except Exception:  # noqa: BLE001
-            stato = 0
-        if stato != 0:
-            raise ValueError("È una riunione con invitati: cancellarla potrebbe mandare disdette. Va cancellata a mano dall'utente in Outlook.")
-        if e_cestino(store, e.Parent):
-            raise ValueError("L'evento è già nel cestino: la cancellazione definitiva non è permessa.")
-        if data_occorrenza:
-            occ = occorrenza_di(e, data_occorrenza)
-            inizio_occ = fmt(occ.Start)
+            status = 0
+        if status != 0:
+            raise ValueError("It is a meeting with attendees: deleting it could send cancellations. The user deletes it by hand in Outlook.")
+        if is_trash(store, e.Parent):
+            raise ValueError("The event is already in the trash: permanent deletion is not allowed.")
+        if occurrence_date:
+            occ = occurrence_of(e, occurrence_date)
+            occ_start = fmt(occ.Start)
             occ.Delete()
-            audit("elimina_evento", casella=casella or CASELLA_PREDEFINITA, id=id, oggetto=ogg, occorrenza=inizio_occ,
-                  serie_intera=False, nota="singola occorrenza, senza cestino")
-            return {"eliminato": True, "oggetto": ogg, "occorrenza": inizio_occ, "serie_intera": False,
-                    "nota": "cancellata solo questa occorrenza: la serie continua; non passa dal cestino, si recupera solo ricreandola"}
-        if bool(e.IsRecurring) and not serie_intera:
-            raise ValueError("Evento ricorrente: serve serie_intera=true (sparisce tutta la serie) oppure data_occorrenza (solo quella occorrenza).")
-        inizio = fmt(e.Start)
-        dest = cestino_di(store)
-        origine = e.Parent.FolderPath
-        # Delete(), non Move(): è la stessa operazione del tasto Canc in Outlook. Verificato sul campo che con alcuni
-        # provider (Kerio Connect via KOFF) un appuntamento spostato con Move() in Posta eliminata, che è una cartella
-        # di posta, viene convertito in un messaggio con allegato .msg e accenti rotti; con Delete() resta un elemento
-        # di calendario ripristinabile.
+            audit("delete_event", mailbox=mailbox or DEFAULT_MAILBOX, id=id, subject=subj, occurrence=occ_start,
+                  whole_series=False, note="single occurrence, no trash")
+            return {"deleted": True, "subject": subj, "occurrence": occ_start, "whole_series": False,
+                    "note": "only this occurrence was deleted: the series continues; it does not go through the trash and can only be recovered by recreating it"}
+        if bool(e.IsRecurring) and not whole_series:
+            raise ValueError("Recurring event: give whole_series=true (the whole series disappears) or occurrence_date (only that occurrence).")
+        start = fmt(e.Start)
+        dest = trash_of(store)
+        origin = e.Parent.FolderPath
+        # Delete(), not Move(): the same operation as the Delete key in Outlook. Verified in the field that with some
+        # providers (Kerio Connect via KOFF) an appointment moved with Move() into Deleted Items, which is a mail
+        # folder, is converted into a message with a .msg attachment and broken accents; with Delete() it remains a
+        # restorable calendar item.
         e.Delete()
-        # Si ritrova l'evento nel cestino per restituirne il nuovo id (comodo per ripristinarlo o verificarlo).
-        id_cestino = None
+        # Find the event in the trash to return its new id (handy to restore or verify it).
+        id_trash = None
         try:
-            r = dest.Items.Restrict("@SQL=\"urn:schemas:httpmail:subject\" = '" + dasl_lit(ogg) + "'")
-            for it in itera(r, 20):
+            r = dest.Items.Restrict("@SQL=\"urn:schemas:httpmail:subject\" = '" + dasl_lit(subj) + "'")
+            for it in iterate(r, 20):
                 if it.Class == 26:
-                    id_cestino = it.EntryID
+                    id_trash = it.EntryID
                     break
         except Exception:  # noqa: BLE001
             pass
-        audit("elimina_evento", casella=casella or CASELLA_PREDEFINITA, id=id, oggetto=ogg, inizio=inizio,
-              serie_intera=bool(serie_intera), da=origine, a=dest.FolderPath, id_nel_cestino=id_cestino)
-        return {"eliminato": True, "oggetto": ogg, "inizio": inizio, "serie_intera": bool(serie_intera),
-                "da": origine, "cestino": dest.FolderPath, "id_nel_cestino": id_cestino,
-                "nota": "spostato nel cestino con Delete, come dal tasto Canc di Outlook: resta un elemento di calendario ripristinabile"}
+        audit("delete_event", mailbox=mailbox or DEFAULT_MAILBOX, id=id, subject=subj, start=start,
+              whole_series=bool(whole_series), from_folder=origin, to_folder=dest.FolderPath, id_in_trash=id_trash)
+        return {"deleted": True, "subject": subj, "start": start, "whole_series": bool(whole_series),
+                "from_folder": origin, "trash": dest.FolderPath, "id_in_trash": id_trash,
+                "note": "moved to the trash with Delete, like the Delete key in Outlook: it remains a restorable calendar item"}
     return await com(f)
 
 
 if __name__ == "__main__":
-    # Avviato da Claude desktop con il trasporto stdio: il server legge le richieste MCP dallo standard input e
-    # risponde sullo standard output. Per questo i log vanno su file e su stderr, mai su stdout.
-    log.info("Avvio outlook-classic-mcp, fase %s, timeout %s s, cancellazione %s", FASE, TIMEOUT, CANCELLAZIONE)
+    # Started by Claude desktop over stdio: the server reads MCP requests from standard input and answers on standard
+    # output. That is why logs go to a file and to stderr, never to stdout.
+    log.info("Starting outlook-classic-mcp, phase %s, timeout %s s, deletion %s", PHASE, TIMEOUT, DELETION)
     mcp.run(transport="stdio")

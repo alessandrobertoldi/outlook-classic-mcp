@@ -1,11 +1,11 @@
-# configurazione personale: nomi delle caselle, cartelle, indirizzi degli avvisi
+# personal configuration: mailbox names, folders, alert addresses
 config.json
 *.bak*
-# ambiente Python e file compilati
+# Python environment and compiled files
 .venv/
 __pycache__/
 *.pyc
-# registri (stanno comunque in %LOCALAPPDATA%, non qui)
+# logs (they live in %LOCALAPPDATA% anyway, not here)
 *.log
-# file di prova
-prova_accenti_*/
+# test files
+accent_test_*/

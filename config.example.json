@@ -1,47 +1,47 @@
 {
-  "_leggimi": [
-    "Copia questo file in config.json (stessa cartella di server.py) e sostituisci i valori fra parentesi angolari.",
-    "config.json e' personale e NON va mai pubblicato: e' gia' escluso da .gitignore.",
-    "Le chiavi che iniziano con _ sono solo commenti: il server le ignora.",
-    "JSON non ammette virgole dopo l'ultimo elemento di un blocco: se il server non parte, controlla quelle."
+  "_readme": [
+    "Copy this file to config.json (same folder as server.py) and replace the values in angle brackets.",
+    "config.json is personal and must NEVER be published: it is already excluded by .gitignore.",
+    "Keys starting with _ are comments only: the server ignores them.",
+    "JSON does not allow a comma after the last element of a block: if the server does not start, check those first."
   ],
 
-  "_fase": "Quanto puo' fare il connettore. 1 = solo leggere (posta, calendario, rubrica, attivita', note). 2 = anche bozze, contatti, attivita', note, cartelle, spostamenti e cancellazione nel cestino delle mail. 3 = anche creare, modificare e cancellare eventi del calendario. 4 = anche invia_avviso. Consiglio: parti da 1, sali quando ti fidi.",
-  "fase": 1,
+  "_phase": "How much the server may do. 1 = read only (mail, calendar, contacts, tasks, notes). 2 = also drafts, contacts, tasks, notes, folders, moves and deletion of mail to the trash. 3 = also create, update and delete calendar events. 4 = also send_alert. Advice: start at 1, move up as trust grows.",
+  "phase": 1,
 
-  "_timeout_secondi": "Attesa massima per una singola richiesta a Outlook. Se Outlook ha una finestra aperta (password, avviso) non risponde: il connettore restituisce un errore spiegato invece di restare bloccato.",
-  "timeout_secondi": 40,
+  "_timeout_seconds": "Maximum wait for a single request to Outlook. When Outlook has a window open (password, warning) it does not answer: the server returns an explained error instead of hanging.",
+  "timeout_seconds": 40,
 
-  "_max_caratteri_corpo": "Lunghezza massima del testo (corpo di mail, eventi, note, attivita') restituito a Claude in una sola lettura.",
-  "max_caratteri_corpo": 20000,
+  "_max_body_chars": "Maximum length of text (mail body, events, notes, tasks) returned to Claude in one read.",
+  "max_body_chars": 20000,
 
-  "_caselle": "Alias breve -> nome dell'archivio ESATTAMENTE come compare in Outlook nel riquadro delle cartelle (il nome in grassetto in cima a ogni account, per esempio 'mario.rossi@esempio.it' oppure 'Mario Rossi'). Claude usera' gli alias. Metti tutti gli account e i file di dati (.pst) che vuoi rendere raggiungibili; quelli non elencati restano invisibili al connettore.",
-  "caselle": {
-    "lavoro": "<nome archivio in Outlook, es. mario.rossi@esempio.it>",
-    "personale": "<nome archivio in Outlook, es. Mario Rossi (Gmail)>",
-    "archivio": "File di dati di Outlook"
+  "_mailboxes": "Short alias -> store name EXACTLY as it appears in Outlook's folder pane (the bold name at the top of each account, e.g. 'john.smith@example.com' or 'John Smith'). Claude will use the aliases. List every account and data file (.pst) you want reachable; the ones not listed stay invisible to the server.",
+  "mailboxes": {
+    "work": "<store name in Outlook, e.g. john.smith@example.com>",
+    "personal": "<store name in Outlook, e.g. John Smith (Gmail)>",
+    "archive": "Outlook Data File"
   },
 
-  "_casella_predefinita": "L'alias (fra quelli sopra) che Claude usa quando non ne indica uno.",
-  "casella_predefinita": "lavoro",
+  "_default_mailbox": "The alias (among those above) Claude uses when it does not name one.",
+  "default_mailbox": "work",
 
-  "_cartelle_salvataggio": "Le sole cartelle del disco in cui il connettore puo' scrivere file (allegati salvati, mail .msg). Vale anche per le sottocartelle. Percorsi Windows con la barra raddoppiata. Almeno una.",
-  "cartelle_salvataggio": [
-    "C:\\Users\\<tuo utente>\\Documents\\Claude",
-    "D:\\<altra cartella consentita>"
+  "_save_folders": "The only disk folders the server may write files to (saved attachments, .msg mail). Subfolders included. Windows paths with doubled backslashes. At least one.",
+  "save_folders": [
+    "C:\\Users\\<your user>\\Documents\\Claude",
+    "D:\\<another allowed folder>"
   ],
 
-  "_cancellazione_abilitata": "true = elimina_mail ed elimina_evento sono attive (spostano nel cestino, mai cancellazione definitiva). false o assente = disattivate.",
-  "cancellazione_abilitata": false,
+  "_deletion_enabled": "true = delete_mail and delete_event are active (they move to the trash, never delete permanently). false or absent = disabled.",
+  "deletion_enabled": false,
 
-  "_avviso": "Sezione facoltativa, usata solo da invia_avviso (fase 4). 'mittente' e' l'indirizzo di un account configurato in Outlook; 'destinatario' e' l'UNICO indirizzo a cui il connettore potra' mai scrivere (di solito un tuo altro indirizzo, o lo stesso). 'prefisso_oggetto' viene anteposto all'oggetto di ogni avviso. Se togli la sezione, invia_avviso rifiuta sempre.",
-  "avviso": {
-    "mittente": "<indirizzo di un account presente in Outlook>",
-    "destinatario": "<tuo indirizzo che riceve gli avvisi>",
-    "prefisso_oggetto": "[Avviso Claude] "
+  "_alert": "Optional section, used only by send_alert (phase 4). 'sender' is the address of an account configured in Outlook; 'recipient' is the ONLY address the server will ever be able to write to (usually another address of yours, or the same one). 'subject_prefix' is prepended to the subject of every alert. Remove the section and send_alert always refuses.",
+  "alert": {
+    "sender": "<address of an account present in Outlook>",
+    "recipient": "<your address that receives the alerts>",
+    "subject_prefix": "[Claude alert] "
   },
 
-  "_pause_di_cortesia": "Ogni chiamata a Outlook gira sul suo filo principale: durante una lettura lunga la finestra di Outlook si blocca. Una pausa di pausa_cortesia_ms millisecondi ogni pausa_ogni_elementi elementi letti lascia respirare Outlook. 0 = nessuna pausa. Si possono cambiare al volo senza riavviare (rilette entro 5 secondi).",
-  "pausa_cortesia_ms": 25,
-  "pausa_ogni_elementi": 2
+  "_courtesy_pauses": "Every call into Outlook runs on its main thread: during a long read the Outlook window freezes. A pause of courtesy_pause_ms milliseconds every pause_every_items items lets Outlook breathe. 0 = no pause. Can be changed on the fly without a restart (re-read within 5 seconds).",
+  "courtesy_pause_ms": 25,
+  "pause_every_items": 2
 }
