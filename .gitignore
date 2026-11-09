@@ -1,0 +1,11 @@
+# configurazione personale: nomi delle caselle, cartelle, indirizzi degli avvisi
+config.json
+*.bak*
+# ambiente Python e file compilati
+.venv/
+__pycache__/
+*.pyc
+# registri (stanno comunque in %LOCALAPPDATA%, non qui)
+*.log
+# file di prova
+prova_accenti_*/

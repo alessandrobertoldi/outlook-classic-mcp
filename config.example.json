@@ -1,0 +1,47 @@
+{
+  "_leggimi": [
+    "Copia questo file in config.json (stessa cartella di server.py) e sostituisci i valori fra parentesi angolari.",
+    "config.json e' personale e NON va mai pubblicato: e' gia' escluso da .gitignore.",
+    "Le chiavi che iniziano con _ sono solo commenti: il server le ignora.",
+    "JSON non ammette virgole dopo l'ultimo elemento di un blocco: se il server non parte, controlla quelle."
+  ],
+
+  "_fase": "Quanto puo' fare il connettore. 1 = solo leggere (posta, calendario, rubrica, attivita', note). 2 = anche bozze, contatti, attivita', note, cartelle, spostamenti e cancellazione nel cestino delle mail. 3 = anche creare, modificare e cancellare eventi del calendario. 4 = anche invia_avviso. Consiglio: parti da 1, sali quando ti fidi.",
+  "fase": 1,
+
+  "_timeout_secondi": "Attesa massima per una singola richiesta a Outlook. Se Outlook ha una finestra aperta (password, avviso) non risponde: il connettore restituisce un errore spiegato invece di restare bloccato.",
+  "timeout_secondi": 40,
+
+  "_max_caratteri_corpo": "Lunghezza massima del testo (corpo di mail, eventi, note, attivita') restituito a Claude in una sola lettura.",
+  "max_caratteri_corpo": 20000,
+
+  "_caselle": "Alias breve -> nome dell'archivio ESATTAMENTE come compare in Outlook nel riquadro delle cartelle (il nome in grassetto in cima a ogni account, per esempio 'mario.rossi@esempio.it' oppure 'Mario Rossi'). Claude usera' gli alias. Metti tutti gli account e i file di dati (.pst) che vuoi rendere raggiungibili; quelli non elencati restano invisibili al connettore.",
+  "caselle": {
+    "lavoro": "<nome archivio in Outlook, es. mario.rossi@esempio.it>",
+    "personale": "<nome archivio in Outlook, es. Mario Rossi (Gmail)>",
+    "archivio": "File di dati di Outlook"
+  },
+
+  "_casella_predefinita": "L'alias (fra quelli sopra) che Claude usa quando non ne indica uno.",
+  "casella_predefinita": "lavoro",
+
+  "_cartelle_salvataggio": "Le sole cartelle del disco in cui il connettore puo' scrivere file (allegati salvati, mail .msg). Vale anche per le sottocartelle. Percorsi Windows con la barra raddoppiata. Almeno una.",
+  "cartelle_salvataggio": [
+    "C:\\Users\\<tuo utente>\\Documents\\Claude",
+    "D:\\<altra cartella consentita>"
+  ],
+
+  "_cancellazione_abilitata": "true = elimina_mail ed elimina_evento sono attive (spostano nel cestino, mai cancellazione definitiva). false o assente = disattivate.",
+  "cancellazione_abilitata": false,
+
+  "_avviso": "Sezione facoltativa, usata solo da invia_avviso (fase 4). 'mittente' e' l'indirizzo di un account configurato in Outlook; 'destinatario' e' l'UNICO indirizzo a cui il connettore potra' mai scrivere (di solito un tuo altro indirizzo, o lo stesso). 'prefisso_oggetto' viene anteposto all'oggetto di ogni avviso. Se togli la sezione, invia_avviso rifiuta sempre.",
+  "avviso": {
+    "mittente": "<indirizzo di un account presente in Outlook>",
+    "destinatario": "<tuo indirizzo che riceve gli avvisi>",
+    "prefisso_oggetto": "[Avviso Claude] "
+  },
+
+  "_pause_di_cortesia": "Ogni chiamata a Outlook gira sul suo filo principale: durante una lettura lunga la finestra di Outlook si blocca. Una pausa di pausa_cortesia_ms millisecondi ogni pausa_ogni_elementi elementi letti lascia respirare Outlook. 0 = nessuna pausa. Si possono cambiare al volo senza riavviare (rilette entro 5 secondi).",
+  "pausa_cortesia_ms": 25,
+  "pausa_ogni_elementi": 2
+}
