@@ -1,0 +1,3 @@
+# Exact versions the server is tested with (install.ps1 installs these). Bump deliberately, then run test_accents.py.
+mcp==2.3.0
+pywin32==312

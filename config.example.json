@@ -6,7 +6,7 @@
     "JSON does not allow a comma after the last element of a block: if the server does not start, check those first."
   ],
 
-  "_phase": "How much the server may do. 1 = read only (mail, calendar, contacts, tasks, notes). 2 = also drafts, contacts, tasks, notes, folders, moves and deletion of mail to the trash. 3 = also create, update and delete calendar events. 4 = also send_alert. Advice: start at 1, move up as trust grows.",
+  "_phase": "How much the server may do. 1 = read only (mail, calendar, contacts, tasks, notes): nothing is written, not even files. 2 = also saving mail and attachments to disk, read/unread flags, drafts, contacts, tasks, notes, folders, moves and deletion of mail to the trash. 3 = also create, update and delete calendar events. 4 = also send_alert. Advice: start at 1, move up as trust grows.",
   "phase": 1,
 
   "_timeout_seconds": "Maximum wait for a single request to Outlook. When Outlook has a window open (password, warning) it does not answer: the server returns an explained error instead of hanging.",
@@ -15,7 +15,7 @@
   "_max_body_chars": "Maximum length of text (mail body, events, notes, tasks) returned to Claude in one read.",
   "max_body_chars": 20000,
 
-  "_mailboxes": "Short alias -> store name EXACTLY as it appears in Outlook's folder pane (the bold name at the top of each account, e.g. 'john.smith@example.com' or 'John Smith'). Claude will use the aliases. List every account and data file (.pst) you want reachable; the ones not listed stay invisible to the server.",
+  "_mailboxes": "Short alias -> store name EXACTLY as it appears in Outlook's folder pane (the bold name at the top of each account, e.g. 'john.smith@example.com' or 'John Smith'). Claude will use the aliases. List every account and data file (.pst) you want reachable; the ones not listed stay invisible to the server, even by exact name. install.ps1 prints the store names.",
   "mailboxes": {
     "work": "<store name in Outlook, e.g. john.smith@example.com>",
     "personal": "<store name in Outlook, e.g. John Smith (Gmail)>",
@@ -31,14 +31,20 @@
     "D:\\<another allowed folder>"
   ],
 
+  "_attach_folders": "The only folders create_draft may take attachments from (subfolders included). Absent or empty = drafts can have NO attachments. Use a folder DIFFERENT from save_folders: a mail read by Claude could otherwise try to get an archived message or a private file attached to a draft. Archived mail (.msg) and fingerprints (.sha256) are never attachable anyway.",
+  "attach_folders": [
+    "C:\\Users\\<your user>\\Documents\\Claude\\to-send"
+  ],
+
   "_deletion_enabled": "true = delete_mail and delete_event are active (they move to the trash, never delete permanently). false or absent = disabled.",
   "deletion_enabled": false,
 
-  "_alert": "Optional section, used only by send_alert (phase 4). 'sender' is the address of an account configured in Outlook; 'recipient' is the ONLY address the server will ever be able to write to (usually another address of yours, or the same one). 'subject_prefix' is prepended to the subject of every alert. Remove the section and send_alert always refuses.",
+  "_alert": "Optional section, used only by send_alert (phase 4). 'sender' is the address of an account configured in Outlook; 'recipient' is the ONLY address the server will ever be able to write to (usually another address of yours, or the same one). 'subject_prefix' is prepended to the subject of every alert. 'max_per_hour' caps the alerts (default 10). Remove the section and send_alert always refuses.",
   "alert": {
     "sender": "<address of an account present in Outlook>",
     "recipient": "<your address that receives the alerts>",
-    "subject_prefix": "[Claude alert] "
+    "subject_prefix": "[Claude alert] ",
+    "max_per_hour": 10
   },
 
   "_courtesy_pauses": "Every call into Outlook runs on its main thread: during a long read the Outlook window freezes. A pause of courtesy_pause_ms milliseconds every pause_every_items items lets Outlook breathe. 0 = no pause. Can be changed on the fly without a restart (re-read within 5 seconds).",

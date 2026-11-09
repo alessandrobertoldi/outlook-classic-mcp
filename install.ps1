@@ -14,6 +14,9 @@
 # It does not touch Outlook, does not store credentials, changes nothing else.
 
 $ErrorActionPreference = 'Stop'
+# Text piped to Python must travel as UTF-8, otherwise an install path with accented letters becomes '?'.
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$env:PYTHONUTF8 = '1'   # and Python must read that pipe as UTF-8 too (stdin from a pipe is not covered by PEP 528)
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
@@ -27,7 +30,7 @@ if (-not (Test-Path "$here\config.json")) {
     exit 1
 }
 try {
-    $cfgTest = (Get-Content "$here\config.json" -Raw) -replace '^\xEF\xBB\xBF', '' | ConvertFrom-Json
+    $cfgTest = (Get-Content "$here\config.json" -Raw -Encoding UTF8) | ConvertFrom-Json
 } catch {
     throw "config.json is not valid JSON: $($_.Exception.Message)"
 }
@@ -56,13 +59,12 @@ if (-not (Test-Path $py)) {
     }
 }
 
-# 3. libraries
-Write-Host '-- installing/updating mcp and pywin32'
+# 3. libraries, at the exact versions listed in requirements.txt (the ones the server is tested with)
+Write-Host '-- installing mcp and pywin32 (versions pinned in requirements.txt)'
 if ($uv) {
-    & uv pip install --python $py --upgrade "mcp>=2,<3" "pywin32>=306"
+    & uv pip install --python $py -r "$here\requirements.txt"
 } else {
-    & $py -m pip install --upgrade pip | Out-Null
-    & $py -m pip install --upgrade "mcp>=2,<3" "pywin32>=306"
+    & $py -m pip install -r "$here\requirements.txt"
 }
 if ($LASTEXITCODE -ne 0) { throw 'Library installation failed: see the error above.' }
 
@@ -119,14 +121,20 @@ if ($candidates.Count -eq 0) {
     Write-Host 'More than one Claude desktop configuration file found:'
     for ($i = 0; $i -lt $candidates.Count; $i++) { Write-Host "  [$($i+1)] $($candidates[$i])" }
     $choice = Read-Host 'Which one? (number; check in Claude desktop > Settings > Developer)'
-    $cfg = $candidates[[int]$choice - 1]
+    $n = 0
+    if (-not [int]::TryParse($choice, [ref]$n) -or $n -lt 1 -or $n -gt $candidates.Count) {
+        throw "Invalid choice '$choice': run the script again and type a number between 1 and $($candidates.Count)."
+    }
+    $cfg = $candidates[$n - 1]
 }
 
 $json = $null
 if (Test-Path $cfg) {
     Copy-Item $cfg "$cfg.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"   # safety copy
-    $raw = (Get-Content $cfg -Raw) -replace '^\xEF\xBB\xBF', ''
-    if ($raw.Trim()) { $json = $raw | ConvertFrom-Json }
+    # -Encoding UTF8: Windows PowerShell 5.1 would otherwise read the file as ANSI and corrupt accented paths of the
+    # OTHER servers configured there when writing it back.
+    $raw = Get-Content $cfg -Raw -Encoding UTF8
+    if ($raw -and $raw.Trim()) { $json = $raw | ConvertFrom-Json }
 }
 if ($null -eq $json) { $json = New-Object PSObject }
 if (-not ($json.PSObject.Properties.Name -contains 'mcpServers') -or $null -eq $json.mcpServers) {
@@ -138,6 +146,12 @@ $entry = [PSCustomObject]@{
     command = $py
     args    = [string[]]@("$here\server.py")
     env     = [PSCustomObject]@{ PYTHONIOENCODING = 'utf-8'; PYTHONUTF8 = '1' }
+}
+if ($json.mcpServers.PSObject.Properties.Name -contains 'outlook') {
+    $old = $json.mcpServers.outlook
+    Write-Host "NOTE: an 'outlook' server is already registered ($($old.command) $($old.args -join ' '))." -ForegroundColor Yellow
+    $ans = Read-Host 'Replace it with this installation? (y/n)'
+    if ($ans -notmatch '^(y|yes|s|si)$') { Write-Host 'Nothing changed in the Claude desktop configuration.'; exit 0 }
 }
 $json.mcpServers | Add-Member -NotePropertyName outlook -NotePropertyValue $entry -Force
 $text = $json | ConvertTo-Json -Depth 10

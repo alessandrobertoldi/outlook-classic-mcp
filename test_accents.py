@@ -9,15 +9,19 @@
 # WHAT IT DOES: creates drafts (text, HTML, reply to the latest received mail, with attachment), saves a mail as .msg
 # and its attachment with SHA-256 fingerprints, reads transport headers, creates an event and deletes it (checking that
 # a calendar item remains in the trash), creates a weekly series of 3 and updates and deletes single occurrences, then
-# the whole series, creates a note and a contact. Every text is read back through the server's own tools and must come
+# the whole series, creates a note and a contact. Finally it checks the security guards: draft attachments outside the
+# allowed folders, network (UNC) paths and alternate data streams refused, stores not in config.json unreachable,
+# attachment names cleaned and marked as downloaded (Mark of the Web), phase 1 really read-only, and a request that
+# times out is cancelled instead of running later. Every text is read back through the server's own tools and must come
 # back identical, without the typical signs of broken accents ("Ã", "â€", "Â", "�"). Every item carries
 # "ACCENT TEST" in its title. At the end it DELETES ONLY the items it created itself (recognised by id), moving them to
 # the trash. It sends nothing: send_alert is not part of the test.
 #
 # REQUIREMENTS: config.json filled in, classic Outlook open as a normal user, at least one mail received in the last 7
 # days in the default mailbox, "phase": 3 or 4 (the test writes drafts and events) and "deletion_enabled": true for the
-# deletion checks (otherwise they are skipped and reported as such). Test files go into a subfolder
-# "accent_test_<date>" of the FIRST folder in "save_folders", created and then removed by the test.
+# deletion checks (otherwise they are skipped and reported as such), "attach_folders" set (the test attaches files).
+# Test files go into a subfolder "accent_test_<date>" of the FIRST folder in "save_folders" and of the FIRST folder
+# in "attach_folders", both created and then removed by the test.
 # RESULT: the last line must be "RESULT: ALL OK".
 
 import asyncio
@@ -26,6 +30,8 @@ import hashlib
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,7 +44,11 @@ created: list[tuple[str, str]] = []  # (description, entry_id)
 results: list[tuple[str, bool, str]] = []
 # Dummy recipient of the drafts (they are never sent) and test folder, inside the first allowed folder.
 TEST_RECIPIENT = "accent.test@example.com"
-TEST_FOLDER = server.SAVE_FOLDERS[0] / dt.datetime.now().strftime("accent_test_%Y%m%d_%H%M%S")
+_STAMP = dt.datetime.now().strftime("accent_test_%Y%m%d_%H%M%S")
+TEST_FOLDER = server.SAVE_FOLDERS[0] / _STAMP                       # where the server saves files
+if not server.ATTACH_FOLDERS:
+    sys.exit("config.json needs \"attach_folders\" for this test (the test attaches files to drafts).")
+ATTACH_FOLDER = server.ATTACH_FOLDERS[0] / _STAMP                   # where the test puts files to attach
 
 
 def sha(p: Path) -> str:
@@ -112,8 +122,8 @@ async def main() -> None:
 
     # 3b. save_mail and save_attachments with fingerprints
     TEST_FOLDER.mkdir(parents=True, exist_ok=False)
-    attachment = TEST_FOLDER / "source" / "attachment già più.txt"
-    attachment.parent.mkdir()
+    ATTACH_FOLDER.mkdir(parents=True, exist_ok=False)
+    attachment = ATTACH_FOLDER / "attachment già più.txt"
     attachment.write_text(TEXT, "utf-8")
     subj = "ACCENT TEST save_mail già più: perché? <ok>"
     b = await server.create_draft(subject=subj, body=TEXT, to=TEST_RECIPIENT, attachments=[str(attachment)])
@@ -243,15 +253,180 @@ async def main() -> None:
     check("create_contact (notes)", ct.get("notes", ""))
     check("create_contact (company)", ct.get("company", ""), "Società è più")
 
+    # 7. security guards
+    await security_checks()
+
+
+async def refused(name: str, coro) -> None:
+    """The call must fail (guard working); if it succeeds, that is a failure of the test."""
+    try:
+        await coro
+        results.append((name, False, "the call was accepted"))
+    except Exception as ex:  # noqa: BLE001
+        results.append((name, True, str(ex)[:120]))
+
+
+async def security_checks() -> None:
+    # 7a. draft attachment outside the allowed folders (a file in the Windows temp folder)
+    outside_file = Path(tempfile.gettempdir()) / "accent_test_private.txt"
+    outside_file.write_text("private", "utf-8")
+    try:
+        if server.path_allowed(outside_file, server.ATTACH_FOLDERS):
+            results.append(("create_draft (attachment outside allowed folders refused)", True, "skipped: temp folder allowed"))
+        else:
+            await refused("create_draft (attachment outside allowed folders refused)",
+                          server.create_draft(subject="ACCENT TEST must not exist", body="x", to=TEST_RECIPIENT,
+                                              attachments=[str(outside_file)]))
+    finally:
+        outside_file.unlink(missing_ok=True)
+    # 7b. network path and alternate data stream: refused by the text check, before any disk or network access
+    #     (192.0.2.1 is a documentation address, never routed: harmless even if the guard failed)
+    unc = r"\\192.0.2.1\share\x"
+    results.append(("UNC path refused without touching the network (lexical check)",
+                    not server.lexically_inside(unc, server.SAVE_FOLDERS), unc))
+    mails = await server.list_mail(days=7, limit=1)
+    if mails:
+        await refused("save_mail (UNC path refused)", server.save_mail(mails[0]["id"], unc))
+        await refused("save_attachments (alternate data stream refused)",
+                      server.save_attachments(mails[0]["id"], str(server.SAVE_FOLDERS[0]) + ":stream"))
+    # 7c. a store of the profile that is NOT in config.json must be unreachable, even by exact name
+    def other_store():
+        configured = set(server.MAILBOXES.values())
+        for st in server.ns().Stores:
+            if st.DisplayName not in configured:
+                return st.DisplayName
+        return None
+    other = await server.com(other_store)
+    if other:
+        await refused("unconfigured mailbox unreachable (by exact store name)", server.list_mail(mailbox=other, limit=1))
+    else:
+        # every store is configured: hide one (not the default) from the configuration for the time of the check
+        alias = next((a for a in server.MAILBOXES if a != server.DEFAULT_MAILBOX), None)
+        if alias is None:
+            results.append(("unconfigured mailbox unreachable", True, "skipped: only one mailbox configured"))
+        else:
+            hidden = server.MAILBOXES.pop(alias)
+            try:
+                await refused(f"unconfigured mailbox unreachable (store '{hidden}' removed from the configuration)",
+                              server.list_mail(mailbox=hidden, limit=1))
+            finally:
+                server.MAILBOXES[alias] = hidden
+    st = await server.outlook_status()
+    results.append(("outlook_status does not list unconfigured stores", "stores_in_outlook" not in st, str(list(st))))
+    # 7d. attachment with a disguised name (right-to-left mark): saved with a clean name and Mark of the Web
+    tricky = ATTACH_FOLDER / "invoice\u202Efdp.txt"
+    tricky.write_text(TEXT, "utf-8")
+    # desktop.ini: Explorer reads it as soon as the folder is opened (icon or target can be a UNC path) and, unlike
+    # .scf or .lnk, Outlook does not hide it as a "Level 1" unsafe attachment, so it reaches save_attachments.
+    ini = ATTACH_FOLDER / "desktop.ini"
+    ini.write_text("[.ShellClassInfo]\r\nIconResource=C:\\nonexistent\\x.ico,0\r\n", "ascii")  # harmless local path
+    b = await server.create_draft(subject="ACCENT TEST tricky attachments", body="x", to=TEST_RECIPIENT,
+                                  attachments=[str(tricky), str(ini)])
+    created.append(("draft with tricky attachments", b["id"]))
+    saved = await server.save_attachments(b["id"], str(TEST_FOLDER / "tricky"))
+    names = {Path(x["saved_to"]).name for x in saved}
+    results.append(("save_attachments (direction marks removed from the name)",
+                    bool(names) and not any("\u202e" in n.lower() for n in names), repr(names)))
+    results.append(("save_attachments (desktop.ini neutralised with .txt)", "desktop.ini.txt" in names, repr(names)))
+    results.append(("save_attachments (both attachments saved)", len(saved) == 2, repr(names)))
+    if saved:
+        sp = Path(saved[0]["saved_to"])
+        try:
+            motw = open(str(sp) + ":Zone.Identifier", encoding="ascii").read()
+        except OSError:
+            motw = ""
+        results.append(("save_attachments (Mark of the Web written)", "ZoneId=3" in motw, repr(motw[:60])))
+    # 7d2. never attach archived mail or fingerprints; HTML drafts must not reference network or local paths
+    fake_msg = ATTACH_FOLDER / "archived.msg"
+    fake_msg.write_bytes(b"x")
+    await refused("create_draft (.msg attachment refused)",
+                  server.create_draft(subject="ACCENT TEST must not exist", body="x", to=TEST_RECIPIENT, attachments=[str(fake_msg)]))
+    await refused("create_draft (HTML with UNC image refused)",
+                  server.create_draft(subject="ACCENT TEST must not exist", to=TEST_RECIPIENT, format="html",
+                                      body='<p>hi</p><img src="\\\\192.0.2.1\\share\\logo.png">'))
+    await refused("create_draft (HTML with file: link refused)",
+                  server.create_draft(subject="ACCENT TEST must not exist", to=TEST_RECIPIENT, format="html",
+                                      body='<a href="file:///C:/Windows/x">x</a>'))
+    # 7d3. alert rate limit, on a temporary counter file (nothing is sent)
+    real_file = server.ALERTS_FILE
+    server.ALERTS_FILE = TEST_FOLDER / "alerts_test.json"
+    try:
+        for _ in range(server.ALERT_MAX_PER_HOUR):
+            server.reserve_alert_slot()
+        try:
+            server.reserve_alert_slot()
+            results.append(("send_alert (hourly limit enforced)", False, "one more than the limit was accepted"))
+        except ValueError:
+            results.append(("send_alert (hourly limit enforced)", True, ""))
+    finally:
+        server.ALERTS_FILE = real_file
+    # 7e. phase 1 must be read-only: no files, no read/unread changes
+    real_phase = server.PHASE
+    server.PHASE = 1
+    try:
+        await refused("phase 1: save_mail refused", server.save_mail(b["id"], str(TEST_FOLDER / "phase1")))
+        await refused("phase 1: save_attachments refused", server.save_attachments(b["id"], str(TEST_FOLDER / "phase1")))
+        await refused("phase 1: mark_mail refused", server.mark_mail(b["id"], read=True))
+    finally:
+        server.PHASE = real_phase
+    # 7f. timeout: a request queued behind a stuck one is cancelled and never runs later (no Outlook involved)
+    real_timeout = server.TIMEOUT
+    server.TIMEOUT = 1
+    ran: list[str] = []
+    try:
+        blocker = threading.Thread(target=lambda: _swallow(lambda: server.COM.run(lambda: time.sleep(3))))
+        blocker.start()
+        time.sleep(0.2)
+        try:
+            server.COM.run(lambda: ran.append("late"))
+            results.append(("timeout: queued request cancelled", False, "it did not time out"))
+        except TimeoutError as ex:
+            results.append(("timeout: queued request reported as cancelled", "cancelled" in str(ex), str(ex)[:120]))
+        time.sleep(0.6)
+        try:
+            server.COM.run(lambda: ran.append("while busy"))
+            results.append(("timeout: new request refused while Outlook is stuck", False, "accepted"))
+        except TimeoutError as ex:
+            results.append(("timeout: new request refused while Outlook is stuck", "still busy" in str(ex), str(ex)[:120]))
+        blocker.join()
+        time.sleep(1.8)  # the stuck request (3 s) ends and the queue moves on: cancelled requests must be skipped
+        results.append(("timeout: cancelled requests never ran afterwards", ran == [], str(ran)))
+    finally:
+        server.TIMEOUT = real_timeout
+    results.append(("after the timeout the server works again", (await server.outlook_status())["ok"], ""))
+    # 7g. send_alert WITHOUT sending: the alert is built and its recipient check passes, then the item is discarded.
+    if server.ALERT_SENDER and server.ALERT_RECIPIENT:
+        def dry_run():
+            m = server.build_alert("ACCENT TEST alert (not sent) già così", TEXT)
+            to = server.recipient_smtp(m.Recipients.Item(1))
+            m.Close(1)  # olDiscard: nothing saved, nothing sent
+            return to
+        try:
+            to = await server.com(dry_run)
+            results.append(("send_alert (dry run: recipient resolved to the configured SMTP address)",
+                            to == server.ALERT_RECIPIENT.lower(), f"resolved={to}"))
+        except Exception as ex:  # noqa: BLE001
+            results.append(("send_alert (dry run)", False, str(ex)[:200]))
+    else:
+        results.append(("send_alert (dry run)", True, "skipped: alert section not configured"))
+
+
+def _swallow(fn) -> None:
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def cleanup() -> None:
     if KEEP:
         print("Test items left in Outlook (--keep):", ", ".join(f"{d}" for d, _ in created))
-        print("Test files left in:", TEST_FOLDER)
+        print("Test files left in:", TEST_FOLDER, "and", ATTACH_FOLDER)
         return
-    if TEST_FOLDER.is_dir() and TEST_FOLDER.name.startswith("accent_test_"):
-        shutil.rmtree(TEST_FOLDER)  # only the folder created by this test
-        print("Test file folder removed:", TEST_FOLDER)
+    for fold in (TEST_FOLDER, ATTACH_FOLDER):
+        if fold.is_dir() and fold.name.startswith("accent_test_"):
+            shutil.rmtree(fold)  # only the folders created by this test
+            print("Test file folder removed:", fold)
 
     def f():
         ns = server.ns()
